@@ -31,3 +31,10 @@ coverage.xml
 /tmp/agb_z_calibration_results.npz
 /tmp/saxs_calibration.json
 /tmp/smi_beamstop_offsets.json
+
+# Docs build output (committed source under docs/source/ only)
+docs/build/
+docs/source/api/generated/
+
+# Stray logs
+*.log

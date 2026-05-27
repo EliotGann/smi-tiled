@@ -1,0 +1,28 @@
+/* Small tweaks to the pydata-sphinx-theme defaults */
+
+/* Inline code: a touch more contrast */
+code.literal {
+  background-color: var(--pst-color-surface);
+  padding: 0.05em 0.35em;
+  border-radius: 3px;
+}
+
+/* Tighten the spacing in big admonition blocks */
+.admonition p {
+  margin-bottom: 0.5em;
+}
+
+/* Card grid on the landing page */
+.bd-sidebar-primary .bd-toc-item.active > a {
+  font-weight: 600;
+}
+
+/* Make tables more readable */
+table.docutils {
+  font-size: 0.95em;
+}
+
+/* Mermaid diagrams need a bit of breathing room */
+.mermaid {
+  margin: 1em 0;
+}

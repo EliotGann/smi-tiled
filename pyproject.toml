@@ -50,8 +50,14 @@ dev = [
     "flake8",
 ]
 docs = [
-    "sphinx",
-    "pydata-sphinx-theme",
+    "sphinx>=7",
+    "pydata-sphinx-theme>=0.15",
+    "myst-parser>=2",
+    "linkify-it-py",                  # needed by myst_parser's 'linkify' ext
+    "sphinx-autodoc-typehints>=2",
+    "sphinx-copybutton",
+    "sphinx-design",
+    "sphinxcontrib-mermaid",
 ]
 all = [
     "smi-tiled[tiled,upload,dev,docs]",
@@ -113,6 +119,12 @@ lint       = "flake8 src/ tests/ --max-line-length=127 --max-complexity=12"
 lint-fatal = "flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics"
 coverage   = "coverage run -m pytest tests/ && coverage report"
 calibrate-z = "python scripts/calibrate_smi_z_scan.py"
+
+# Documentation
+docs-build = "sphinx-build -b html docs/source docs/build/html --keep-going -n"
+docs-clean = "rm -rf docs/build"
+docs-serve = "python -m http.server -d docs/build/html 8765"
+docs-linkcheck = "sphinx-build -b linkcheck docs/source docs/build/linkcheck"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
