@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.56.0
+          cache: true
+
+      - name: Pixi info
+        run: pixi info
+
+      - name: Install
+        run: pixi install -e default
+
+      - name: Lint (fatal errors only)
+        run: pixi run lint-fatal
+
+      - name: Test
+        run: pixi run test-quick
+
+      - name: Coverage
+        if: matrix.python-version == '3.12'
+        run: pixi run coverage

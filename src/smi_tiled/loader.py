@@ -1,0 +1,2636 @@
+"""
+TiledSMISWAXSLoader
+====================
+A PyHyperScattering-compatible tiled data loader for the SMI WAXS+SAXS
+instrument at NSLS-II.
+
+Design principles
+-----------------
+- Follows the FileLoader attribute contract used by SST1RSoXSDB /
+  PFGeneralIntegrator so that an existing PFGeneralIntegrator(geomethod=
+  'template_xr') call works without modification.
+- Detects SAXS (Pilatus 2M, fixed flat panel) and WAXS (900KW, 3-panel folded
+  arc detector) separately and returns correctly-typed xr.DataArray objects.
+- All geometry arrives as xr.DataArray.attrs, mirroring the PyHyperScattering
+  convention: dist, poni1, poni2, rot1, rot2, rot3, pixel1, pixel2, energy,
+  wavelength.  SMI-specific extras (panel geometry, arc angle, beamstop …) live
+  under the ``smi_`` prefix.
+- Metadata fallback order: user overrides > baseline stream > primary
+  configuration > start > defaults.
+"""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import time
+
+import numpy as np
+import xarray as xr
+
+
+# ---------------------------------------------------------------------------
+# Per-run baseline cache  (avoids re-reading 564-column DataFrames)
+# ---------------------------------------------------------------------------
+_BASELINE_CACHE: dict[str, xr.Dataset | None] = {}  # keyed by run UID
+_BASELINE_COLUMNS_CACHE: dict[str, list[str]] = {}   # keyed by run UID
+_TARGET_FILE_NAME_CACHE: dict[str, list[dict[str, float]] | None] = {}  # keyed by run UID
+# Per-run sort indices for primary-stream scalars.  Set to None when the
+# scalar table is already chronologically ordered (no reindex needed); set
+# to a numpy index array when scalars must be re-sorted to align with the
+# (chronological) image stack.  See _primary_seq_sort_indices().
+_PRIMARY_SEQ_SORT_CACHE: dict[str, np.ndarray | None] = {}
+
+
+def clear_baseline_cache() -> None:
+    """Free cached baseline and per-run data.  Safe to call at any time."""
+    _BASELINE_CACHE.clear()
+    _BASELINE_COLUMNS_CACHE.clear()
+    _TARGET_FILE_NAME_CACHE.clear()
+    _PRIMARY_SEQ_SORT_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+PILATUS_PIXEL_SIZE_M: float = 0.172e-3           # 172 µm in metres
+_HBAR_C_EV_M: float = 1.239841984e-6             # eV·m  →  λ = hbar_c / E(eV)
+
+SAXS_IMAGE_FIELD = "pil2M_image"
+WAXS_IMAGE_FIELD = "pil900KW_image"
+WAXS_ARC_FIELD   = "waxs_arc"
+WAXS_BSX_FIELD   = "waxs_bsx"
+
+DEFAULT_TILED_URI = "https://tiled.nsls2.bnl.gov"
+DEFAULT_CATALOG   = "smi/migration"
+DEFAULT_ENERGY_KEV = 16.1
+
+# SAXS defaults (Pilatus 2M at SMI long-distance position)
+_SAXS_DEFAULT_DISTANCE_MM  = 2000.0
+_SAXS_DEFAULT_BEAM_ROW_PX  = 1165.0          # fallback if metadata absent
+_SAXS_DEFAULT_BEAM_COL_PX  =  746.0          # fallback if metadata absent
+# Offset between pil2M_motor_z readback and actual sample-detector distance,
+# at piezo_z = piezo_z_ref.  Calibrated against AGB ring radius on scan
+# b0f165c4-… (AGB_scan_x_y_9m, motor_z=9200, fitted SDD=9007, → −193).
+_SAXS_DEFAULT_DISTANCE_DELTA_MM = -193.0
+_SAXS_DEFAULT_BEAM_DELTA_ROW_PX =  0.0        # additive correction to metadata row
+_SAXS_DEFAULT_BEAM_DELTA_COL_PX =  0.0        # additive correction to metadata col
+
+# SAXS motor-driven geometry corrections.
+# The baseline EPICS PVs (pil2M_beam_center_x_px, pil2M_beam_center_y_px) are
+# static calibration values, set once at a known motor configuration.  When
+# the detector translates (pil2M_motor_x/y) or the sample moves along the beam
+# (piezo_z), the physical beam position on the detector and the effective
+# sample-detector distance both shift.  These constants encode the linear
+# mapping; values are overrideable per-call.  Calibrated from the AGB grid
+# scan b0f165c4-203e-4d58-af17-916620b974c2 (regression residuals ≤1 px).
+_SAXS_MOTOR_X_REF_MM: float = 1.88             # baseline EPICS bc_col matches actual at this motor_x
+_SAXS_MOTOR_Y_REF_MM: float = 2.45             # baseline EPICS bc_row matches actual at this motor_y
+_SAXS_MOTOR_Z_REF_MM: float = 0.0              # motor_z reference (BC drift relative to here)
+_SAXS_PIEZO_Z_REF_UM: float = 0.0              # piezo_z reference (offset absorbed in DISTANCE_DELTA)
+# px/mm slopes from regression: motor_x→bc_col slope = 5.821 = 1/0.172 exactly.
+# motor_y→bc_row slope ≈ 5.996 (slightly steeper than nominal; possibly the
+# stage is not perfectly perpendicular).
+_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM: float = +5.8211
+_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM: float = +5.9963
+# motor_z → BC drift: if the beam is perfectly along the motor_z axis,
+# these are zero.  Non-zero values indicate small misalignment of the
+# beam axis vs the motor_z translation axis, derived from an AGB
+# distance-grid scan (calibrate_smi_z_scan.py).
+_SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM: float = 0.0
+_SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM: float = 0.0
+# piezo_z (μm) → SDD: positive piezo_z moves sample downstream (toward
+# detector?) but with slope close to +1 mm/mm in the fit.  Sign-positive
+# means +piezo → +SDD; verify in subsequent calibrations.
+_SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM: float = +0.000988
+
+# WAXS defaults (900KW arc detector at ~274 mm)
+_WAXS_DEFAULT_DISTANCE_MM  = 270.0
+_WAXS_DEFAULT_BEAM_ROW_PX  = 217.0            # fallback if metadata absent
+_WAXS_DEFAULT_BEAM_COL_PX  = 319.0            # fallback if metadata absent
+_WAXS_DEFAULT_BEAM_DELTA_ROW_PX =  0.0        # additive correction to metadata row
+_WAXS_DEFAULT_BEAM_DELTA_COL_PX = -4.5        # additive correction to metadata col
+_WAXS_DEFAULT_PANEL_OFFSETS_DEG = (-7.0, 0.0, 7.0)
+_WAXS_DEFAULT_PANEL_COL_RANGES  = ((0, 206), (206, 413), (413, 619))
+_WAXS_ROTATION_K = 3                             # np.rot90 k-value
+
+
+# ---------------------------------------------------------------------------
+# Optional JSON override of calibration constants
+# ---------------------------------------------------------------------------
+#
+# At import time we look for a JSON file alongside the bundled masks at
+# ``smi_tiled/data/saxs_calibration.json``.  When present, its
+# ``constants`` block overrides any of the ``_SAXS_*`` module-level values
+# above.  This lets a beamline scientist re-calibrate (via
+# ``calibrate_smi_z_scan.py`` and friends) without editing source code.
+#
+# Schema (all keys optional):
+#
+#     {
+#       "_doc": "...",
+#       "source_uid": "...",
+#       "constants": {
+#         "_SAXS_DEFAULT_DISTANCE_DELTA_MM": -203.6,
+#         "_SAXS_MOTOR_X_REF_MM": 1.88,
+#         "_SAXS_MOTOR_Y_REF_MM": 2.45,
+#         "_SAXS_MOTOR_Z_REF_MM": 0.0,
+#         "_SAXS_PIEZO_Z_REF_UM": 0.0,
+#         "_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM": 5.8211,
+#         "_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM": 5.9963,
+#         "_SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM": 0.0,
+#         "_SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM": 0.0,
+#         "_SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM": 0.000988
+#       }
+#     }
+#
+# Unknown keys are ignored with a warning.
+
+def _apply_calibration_override() -> dict | None:
+    """Look for a calibration JSON next to the bundled masks and apply it.
+
+    Returns the loaded JSON payload (for inspection / logging) or ``None``
+    when no override file is present or readable.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    here = _Path(__file__).resolve().parent
+    calib_path = here / "data" / "saxs_calibration.json"
+    if not calib_path.exists():
+        return None
+    try:
+        payload = _json.loads(calib_path.read_text())
+    except Exception as exc:  # pragma: no cover
+        import warnings as _warnings
+        _warnings.warn(
+            f"Failed to read SAXS calibration override {calib_path}: {exc}",
+            stacklevel=2,
+        )
+        return None
+    constants = payload.get("constants") or {}
+    globals_ = globals()
+    known = {
+        "_SAXS_DEFAULT_DISTANCE_DELTA_MM",
+        "_SAXS_MOTOR_X_REF_MM", "_SAXS_MOTOR_Y_REF_MM",
+        "_SAXS_MOTOR_Z_REF_MM", "_SAXS_PIEZO_Z_REF_UM",
+        "_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM",
+        "_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM",
+        "_SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM",
+        "_SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM",
+        "_SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM",
+        "_SAXS_DEFAULT_BEAM_DELTA_ROW_PX",
+        "_SAXS_DEFAULT_BEAM_DELTA_COL_PX",
+    }
+    for name, value in constants.items():
+        if name not in known:
+            import warnings as _warnings
+            _warnings.warn(
+                f"Unknown calibration constant {name!r} in {calib_path}",
+                stacklevel=2,
+            )
+            continue
+        globals_[name] = float(value)
+    return payload
+
+
+_SAXS_CALIBRATION_OVERRIDE = _apply_calibration_override()
+
+
+# ---------------------------------------------------------------------------
+# HDF5 disk cache support (SMI Browser cache / self-populated cache)
+# ---------------------------------------------------------------------------
+#
+# Cache layout:
+#   /primary/<field>    — 1-D arrays of per-frame scalar values
+#   /baseline/<field>   — 1-D arrays (typically length 1–2)
+#   /images/<field>     — 3-D detector stacks (N, H, W)
+#   /reduction/         — (written by smi_browser, not used here)
+#
+# Reading functions return None when the requested data isn't cached,
+# letting callers fall back to tiled transparently.
+# ---------------------------------------------------------------------------
+
+def _auto_cache_path(uid: str) -> Path | None:
+    """Return the HDF5 cache path for *uid* if it exists on disk.
+
+    Checks ``$SMI_BROWSER_CACHE_DIR`` first, falling back to
+    ``$TMPDIR/smi_browser_cache/``.  Returns ``None`` if no cached file
+    is found.
+    """
+    import os
+    import tempfile
+
+    cache_dir = os.environ.get("SMI_BROWSER_CACHE_DIR")
+    if not cache_dir:
+        cache_dir = str(Path(tempfile.gettempdir()) / "smi_browser_cache")
+    p = Path(cache_dir) / f"{uid}.h5"
+    return p if p.exists() else None
+
+
+def _cache_dir() -> Path:
+    """Return the cache directory path (creating it if needed)."""
+    import os
+    import tempfile
+
+    cache_dir = os.environ.get("SMI_BROWSER_CACHE_DIR")
+    if not cache_dir:
+        cache_dir = str(Path(tempfile.gettempdir()) / "smi_browser_cache")
+    p = Path(cache_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _read_cached_images(cache_path: str | Path, field: str) -> np.ndarray | None:
+    """Read an image stack from the disk cache.
+
+    Returns
+    -------
+    np.ndarray or None
+        Shape ``(N, H, W)`` if the field exists, else ``None``.
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with h5py.File(cache_path, "r") as f:
+            key = f"images/{field}"
+            if key not in f:
+                return None
+            return f[key][...]
+    except Exception:
+        return None
+
+
+def _read_cached_primary_field(cache_path: str | Path, field: str) -> np.ndarray | None:
+    """Read a single primary-stream field from the disk cache.
+
+    Returns
+    -------
+    np.ndarray or None
+        1-D array if the field exists, else ``None``.
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with h5py.File(cache_path, "r") as f:
+            key = f"primary/{field}"
+            if key not in f:
+                return None
+            return f[key][...]
+    except Exception:
+        return None
+
+
+def _read_cached_baseline(cache_path: str | Path) -> dict[str, np.ndarray] | None:
+    """Read the full baseline group from the disk cache.
+
+    Returns
+    -------
+    dict or None
+        Mapping of field name → 1-D numpy array, or ``None`` if the
+        baseline group does not exist in the cache.
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with h5py.File(cache_path, "r") as f:
+            if "baseline" not in f:
+                return None
+            grp = f["baseline"]
+            return {name: grp[name][...] for name in grp}
+    except Exception:
+        return None
+
+
+def _read_cached_baseline_field(cache_path: str | Path, field: str) -> np.ndarray | None:
+    """Read a single baseline field from the disk cache.
+
+    Returns
+    -------
+    np.ndarray or None
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with h5py.File(cache_path, "r") as f:
+            key = f"baseline/{field}"
+            if key not in f:
+                return None
+            return f[key][...]
+    except Exception:
+        return None
+
+
+def populate_cache(
+    uid: str,
+    run: Any,
+    cache_path: str | Path | None = None,
+    include_images: bool = True,
+) -> Path:
+    """Populate the HDF5 disk cache for a run from tiled data.
+
+    This fetches primary scalars, baseline scalars, and (optionally) raw
+    detector images from tiled and writes them into a single HDF5 file.
+    Subsequent reduction calls with the same UID will read from the cache
+    instead of making HTTP round-trips.
+
+    Parameters
+    ----------
+    uid : str
+        Run UID.
+    run : tiled run object
+        An already-connected tiled run (e.g. from ``client[catalog/uid]``).
+    cache_path : str, Path, or None
+        Explicit path for the cache file.  If ``None``, uses the default
+        location (``$SMI_BROWSER_CACHE_DIR/<uid>.h5`` or
+        ``$TMPDIR/smi_browser_cache/<uid>.h5``).
+    include_images : bool
+        If True (default), also cache raw detector image stacks.  Set to
+        False if you only want scalar metadata cached (much faster).
+
+    Returns
+    -------
+    Path
+        The path to the written cache file.
+    """
+    import h5py
+
+    if cache_path is None:
+        cache_path = _cache_dir() / f"{uid}.h5"
+    else:
+        cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(cache_path, "a") as f:
+        # --- Primary scalars ---
+        if "primary" not in f:
+            f.create_group("primary")
+        primary_grp = f["primary"]
+
+        # Read scalar fields from primary/internal (non-image columns)
+        _primary_fields = _get_primary_scalar_fields(run)
+        for field_name, arr in _primary_fields.items():
+            if field_name not in primary_grp:
+                primary_grp.create_dataset(field_name, data=arr)
+
+        # --- Baseline ---
+        if "baseline" not in f:
+            f.create_group("baseline")
+        baseline_grp = f["baseline"]
+
+        baseline_ds = _read_baseline(run)
+        if baseline_ds is not None:
+            for var_name in baseline_ds.data_vars:
+                if var_name not in baseline_grp:
+                    try:
+                        arr = np.asarray(baseline_ds[var_name].values)
+                        if arr.dtype.kind in ("f", "i", "u"):
+                            baseline_grp.create_dataset(var_name, data=arr)
+                    except Exception:
+                        pass
+
+        # --- Images ---
+        if include_images:
+            if "images" not in f:
+                f.create_group("images")
+            images_grp = f["images"]
+
+            for field in (SAXS_IMAGE_FIELD, WAXS_IMAGE_FIELD):
+                if field in images_grp:
+                    continue  # already cached
+                if _has_primary_field(run, field):
+                    try:
+                        arr = _read_primary_field(run, field)
+                        if arr is not None and arr.ndim >= 2:
+                            if arr.ndim == 2:
+                                arr = arr[np.newaxis, :, :]
+                            images_grp.create_dataset(
+                                field,
+                                data=arr,
+                                chunks=(1, arr.shape[1], arr.shape[2]),
+                                compression="gzip",
+                                compression_opts=2,
+                            )
+                    except Exception:
+                        pass
+
+    return cache_path
+
+
+def _get_primary_scalar_fields(run: Any) -> dict[str, np.ndarray]:
+    """Read all non-image scalar fields from primary into a dict.
+
+    This is used for cache population — it reads per-frame 1-D arrays
+    for motors/signals that live alongside detector images in the primary
+    stream.
+    """
+    results: dict[str, np.ndarray] = {}
+    _IMAGE_FIELDS = {SAXS_IMAGE_FIELD, WAXS_IMAGE_FIELD}
+
+    try:
+        primary = run["primary"]
+    except Exception:
+        return results
+
+    # Try modern layout: primary/data/<field>
+    field_container = None
+    try:
+        field_container = primary["data"]
+    except Exception:
+        pass
+    if field_container is None:
+        # Old layout: primary itself is the container
+        field_container = primary
+
+    try:
+        field_names = list(field_container)
+    except Exception:
+        return results
+
+    for name in field_names:
+        if name in _IMAGE_FIELDS:
+            continue
+        try:
+            node = field_container[name]
+            raw = node.read() if hasattr(node, "read") else node[...]
+            arr = np.asarray(raw)
+            # Only cache numeric 1-D arrays (scalars per frame)
+            if arr.ndim <= 1 and arr.dtype.kind in ("f", "i", "u"):
+                results[name] = arr.ravel()
+        except Exception:
+            continue
+
+    return results
+
+
+def _prepopulate_caches_from_h5(run: Any, cache_path: str | Path) -> None:
+    """Pre-populate module-level baseline/primary caches from an HDF5 file.
+
+    This fills ``_BASELINE_CACHE`` with an xr.Dataset built from the
+    ``/baseline`` group, so that all subsequent ``_baseline_scalar()`` calls
+    within this run hit the in-memory cache instead of tiled.
+    """
+    _rid = _run_uid(run)
+
+    # --- Baseline ---
+    if _rid not in _BASELINE_CACHE:
+        baseline_dict = _read_cached_baseline(cache_path)
+        if baseline_dict is not None:
+            ds = xr.Dataset(
+                {k: xr.DataArray(v) for k, v in baseline_dict.items()}
+            )
+            _BASELINE_CACHE[_rid] = ds
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _as_scalar(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "values"):
+        value = value.values
+    arr = np.asarray(value)
+    if arr.size == 0:
+        return None
+    item = arr.reshape(-1)[0]
+    return item.item() if hasattr(item, "item") else item
+
+
+def _run_uid(run: Any) -> str:
+    """Extract a stable UID string from a tiled run object."""
+    try:
+        return run.metadata["start"]["uid"]
+    except Exception:
+        # Fallback: use object id if metadata is unavailable
+        return str(id(run))
+
+
+def _primary_seq_sort_indices(run: Any) -> np.ndarray | None:
+    """Return argsort indices that reorder primary scalars to chronological order.
+
+    The SMI tiled migration catalog has been observed to serve primary-stream
+    *scalar* tables (motors, signals) in a non-chronological order while the
+    *image* stack remains in chronological (seq_num) order.  Reading
+    ``motor_x[i]`` and ``pil2M_image[i]`` then yields a *mismatched* pair.
+
+    This helper reads ``seq_num`` from the primary stream and returns the
+    indices that sort it to chronological order.  Callers reading any
+    per-frame scalar should apply these indices so the array aligns with
+    ``image[i]``.  Returns ``None`` when seq_num is already monotonic (no
+    reindex needed) or unavailable.  Results are cached per run UID.
+    """
+    rid = _run_uid(run)
+    if rid in _PRIMARY_SEQ_SORT_CACHE:
+        return _PRIMARY_SEQ_SORT_CACHE[rid]
+
+    seq_arr: np.ndarray | None = None
+    try:
+        node = _get_primary_field_node(run, "seq_num")
+        raw = node.read() if hasattr(node, "read") else node[...]
+        seq_arr = np.asarray(raw).astype(np.int64).ravel()
+    except Exception:
+        seq_arr = None
+
+    if seq_arr is None or seq_arr.size == 0:
+        _PRIMARY_SEQ_SORT_CACHE[rid] = None
+        return None
+
+    if np.all(np.diff(seq_arr) > 0):
+        _PRIMARY_SEQ_SORT_CACHE[rid] = None  # already chronological
+        return None
+
+    order = np.argsort(seq_arr, kind="stable")
+    _PRIMARY_SEQ_SORT_CACHE[rid] = order
+    return order
+
+
+def _apply_primary_sort(arr: np.ndarray | None, run: Any) -> np.ndarray | None:
+    """Reorder a 1-D per-frame primary scalar to chronological seq order.
+
+    No-op when shape doesn't match the seq_num length or the table is
+    already monotonic (see :func:`_primary_seq_sort_indices`).
+    """
+    if arr is None:
+        return None
+    order = _primary_seq_sort_indices(run)
+    if order is None:
+        return arr
+    arr = np.asarray(arr)
+    if arr.ndim != 1 or arr.shape[0] != order.shape[0]:
+        return arr
+    return arr[order]
+
+
+def _read_baseline(run: Any) -> xr.Dataset | None:
+    """Read the baseline stream as an xr.Dataset (legacy path).
+
+    Falls back to the new bluesky-tiled-plugins layout where baseline is
+    accessed via ``run["baseline"]["internal"]`` (a DataFrameClient) rather
+    than ``run["baseline"].read()`` (which raises KeyError('data')).
+
+    Results are cached per run UID to avoid repeated conversion of the
+    564-column DataFrame into an xr.Dataset (which is very expensive due
+    to xarray merge/alignment overhead).
+    """
+    _rid = _run_uid(run)
+    if _rid in _BASELINE_CACHE:
+        return _BASELINE_CACHE[_rid]
+
+    result: xr.Dataset | None = None
+    try:
+        result = run["baseline"].read()
+    except (KeyError, Exception):
+        pass
+    if result is None:
+        # New layout: baseline["internal"] is a DataFrameClient (pandas-like).
+        # Convert to xr.Dataset so existing _dataset_scalar() calls still work.
+        try:
+            internal = run["baseline"]["internal"]
+            df = internal.read() if hasattr(internal, "read") else None
+            if df is not None:
+                import pandas as pd
+                if isinstance(df, pd.DataFrame):
+                    result = xr.Dataset.from_dataframe(df)
+                elif isinstance(df, xr.Dataset):
+                    result = df
+        except Exception:
+            pass
+
+    _BASELINE_CACHE[_rid] = result
+    return result
+
+
+def _baseline_scalar(run: Any, key: str) -> Any:
+    """Read a single scalar from the baseline stream (first value).
+
+    Uses the cached full-baseline Dataset when available (avoids per-key
+    HTTP round-trips).  Falls back to per-column tiled access, then to a
+    full baseline read.
+    """
+    # Fastest path: use the already-cached xr.Dataset
+    _rid = _run_uid(run)
+    if _rid in _BASELINE_CACHE:
+        return _dataset_scalar(_BASELINE_CACHE[_rid], key)
+
+    # Per-column access via tiled (one HTTP call per key)
+    try:
+        internal = run["baseline"]["internal"]
+        if _rid in _BASELINE_COLUMNS_CACHE:
+            columns = _BASELINE_COLUMNS_CACHE[_rid]
+        else:
+            columns = list(internal)
+            _BASELINE_COLUMNS_CACHE[_rid] = columns
+        if key in columns:
+            vals = internal[key].read() if hasattr(internal[key], "read") else internal[key][...]
+            return _as_scalar(np.asarray(vals))
+    except Exception:
+        pass
+    # Fallback: full baseline read (old layout or xr.Dataset path)
+    baseline = _read_baseline(run)
+    return _dataset_scalar(baseline, key)
+
+
+def _dataset_scalar(ds: xr.Dataset | None, key: str) -> Any:
+    if ds is None or key not in ds:
+        return None
+    return _as_scalar(ds[key].values)
+
+
+def _conf_scalar(conf: dict, key: str) -> Any:
+    return _as_scalar(conf.get(key))
+
+
+def _primary_conf(run: Any, det_key: str) -> dict:
+    try:
+        return (
+            run["primary"]
+            .metadata.get("configuration", {})
+            .get(det_key, {})
+            .get("data", {})
+        )
+    except Exception:
+        return {}
+
+
+def _primary_scalar(run: Any, field: str) -> Any:
+    """Read a scalar motor/signal value from the primary stream.
+
+    Only returns a value if the field exists in primary AND has a single
+    unique value (i.e., it's a "read" companion, not the varying scan axis).
+    For varying scan axes, use _read_scan_axis() instead.
+
+    For scrambled tables, "first" means chronologically first (seq_num=1),
+    which requires sorting before indexing.
+    """
+    if not _has_primary_field(run, field):
+        return None
+    try:
+        node = _get_primary_field_node(run, field)
+        values = node.read() if hasattr(node, "read") else node[...]
+        arr = np.asarray(values, dtype=float)
+        # If all values are the same, sort doesn't matter — just return one
+        if arr.size > 0 and np.all(arr == arr[0]):
+            return float(arr[0])
+        # Otherwise reorder to chronological order so [0] is the first frame
+        if arr.size > 0:
+            arr = _apply_primary_sort(arr, run)
+            return float(arr[0])
+    except Exception:
+        pass
+    return None
+
+
+def _read_first_scalar(
+    run: Any,
+    field: str,
+    baseline_keys: tuple[str, ...] = (),
+    baseline_ds: xr.Dataset | None = None,
+) -> float | None:
+    """Resolve a motor scalar: primary first-frame → baseline → baseline ds.
+
+    Used by geometry resolvers to get a single reference value for a motor
+    that may be in any of (a) the primary stream as a per-frame array,
+    (b) the baseline stream as a 1- or 2-element snapshot, or (c) absent.
+    Returns ``None`` when the field cannot be located anywhere.
+    """
+    val = _primary_scalar(run, field)
+    if val is not None:
+        return float(val)
+    for key in baseline_keys or (field,):
+        val = _baseline_scalar(run, key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+        val = _dataset_scalar(baseline_ds, key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Primary/internal stream helpers
+# ---------------------------------------------------------------------------
+
+def _has_primary_internal_field(run: Any, field: str) -> bool:
+    """Return True if the given field exists in primary/internal."""
+    try:
+        internal = run["primary"]["internal"]
+        return field in list(internal)
+    except Exception:
+        return False
+
+
+def _read_primary_internal_array(run: Any, field: str) -> np.ndarray | None:
+    """Read a per-frame array from primary/internal.
+
+    Returns None if the field is not present or cannot be read.
+    """
+    try:
+        internal = run["primary"]["internal"]
+        if field not in list(internal):
+            return None
+        node = internal[field]
+        values = node.read() if hasattr(node, "read") else node[...]
+        return np.asarray(values)
+    except Exception:
+        return None
+
+
+def _read_target_file_name_geometry(run: Any) -> list[dict[str, float]] | None:
+    """Parse per-frame geometry from the target_file_name field in primary/internal.
+
+    Returns a list of dicts (one per frame), each containing parsed geometry
+    parameters (waxs_arc_deg, energy_kev, incident_angle_deg, etc.).
+    Returns None if target_file_name is not available.
+    """
+    _rid = _run_uid(run)
+    if _rid in _TARGET_FILE_NAME_CACHE:
+        return _TARGET_FILE_NAME_CACHE[_rid]
+
+    raw = _read_primary_internal_array(run, "target_file_name")
+    if raw is None:
+        _TARGET_FILE_NAME_CACHE[_rid] = None
+        return None
+
+    result = []
+    for name in raw:
+        name_str = str(name) if not isinstance(name, str) else name
+        result.append(parse_sample_name_geometry(name_str))
+
+    _TARGET_FILE_NAME_CACHE[_rid] = result
+    return result
+
+
+def _energy_to_wavelength_m(energy_ev: float) -> float:
+    return _HBAR_C_EV_M / float(energy_ev)
+
+
+# ---------------------------------------------------------------------------
+# Sample name parsing
+# ---------------------------------------------------------------------------
+
+def parse_sample_name_geometry(sample_name: str) -> dict[str, float]:
+    """Extract geometry parameters encoded in the sample_name string.
+
+    Common SMI naming conventions:
+      _wa{X}_   → WAXS arc angle (degrees)
+      _sdd{X}m  → sample-detector distance (metres)
+      _{X}keV   → photon energy (keV)
+      _ai{X}_   → incident angle (degrees)
+      _th{X}_   → sample theta (degrees)
+
+    Returns a dict with only the keys that were successfully parsed.
+    """
+    result: dict[str, float] = {}
+
+    # WAXS arc angle: _wa20.0_ or _wa20.0 (at end)
+    m = re.search(r"_wa([\d.]+)", sample_name)
+    if m:
+        result["waxs_arc_deg"] = float(m.group(1))
+
+    # Sample-detector distance: _sdd2.0m or _sdd2.0m_ (value in metres)
+    m = re.search(r"_sdd([\d.]+)m?", sample_name)
+    if m:
+        result["sdd_m"] = float(m.group(1))
+
+    # Photon energy: _16.10keV_ or _4064.00eV_
+    m = re.search(r"_([\d.]+)keV", sample_name)
+    if m:
+        result["energy_kev"] = float(m.group(1))
+    else:
+        m = re.search(r"_([\d.]+)eV", sample_name)
+        if m:
+            result["energy_kev"] = float(m.group(1)) / 1000.0
+
+    # Incident angle: _ai0.12_
+    m = re.search(r"_ai([\d.]+)", sample_name)
+    if m:
+        result["incident_angle_deg"] = float(m.group(1))
+
+    # Sample theta: _th0.5_
+    m = re.search(r"_th([\d.]+)", sample_name)
+    if m:
+        result["theta_deg"] = float(m.group(1))
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Geometry resolution dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SAXSGeometry:
+    """Resolved geometry parameters for the SAXS (Pilatus 2M) detector.
+
+    All values represent the *reference* (first-frame, or single-geometry)
+    state.  Per-frame motor positions are attached to the loader's DataArray
+    as coords on the frame dim; downstream code that needs per-frame geometry
+    should consume those.
+    """
+    dist_m: float
+    poni1_m: float
+    poni2_m: float
+    pixel1_m: float = PILATUS_PIXEL_SIZE_M
+    pixel2_m: float = PILATUS_PIXEL_SIZE_M
+    rot1: float = 0.0
+    rot2: float = 0.0
+    rot3: float = 0.0
+    energy_ev: float = DEFAULT_ENERGY_KEV * 1000.0
+    wavelength_m: float = _energy_to_wavelength_m(DEFAULT_ENERGY_KEV * 1000.0)
+    beam_center_row_px: float = _SAXS_DEFAULT_BEAM_ROW_PX
+    beam_center_col_px: float = _SAXS_DEFAULT_BEAM_COL_PX
+    active_beamstop: str = "rod"
+    beamstop_pos_mm: dict | None = None
+    # Motor positions used to compute this geometry (reference frame value).
+    # Populated by resolve_saxs_geometry; None when the field is unavailable.
+    motor_x_mm: float | None = None
+    motor_y_mm: float | None = None
+    motor_z_mm: float | None = None
+    piezo_z_um: float | None = None
+
+
+@dataclass
+class WAXSPanelGeometry:
+    """Geometry for a single WAXS panel."""
+    col_start: int
+    col_end: int
+    offset_deg: float
+    row_shift_px: float = 0.0
+    col_shift_px: float = 0.0
+
+
+@dataclass
+class WAXSGeometry:
+    """Resolved geometry for the WAXS (900KW 3-panel arc) detector."""
+    dist_m: float
+    beam_center_row_px: float
+    beam_center_col_px: float
+    pixel_m: float = PILATUS_PIXEL_SIZE_M
+    energy_ev: float = DEFAULT_ENERGY_KEV * 1000.0
+    wavelength_m: float = _energy_to_wavelength_m(DEFAULT_ENERGY_KEV * 1000.0)
+    theta_zero_deg: float = 0.0
+    sample_offset_x_mm: float = 0.0
+    sample_offset_z_mm: float = 0.0
+    rotation_k: int = _WAXS_ROTATION_K
+    panels: tuple[WAXSPanelGeometry, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# Geometry resolvers
+# ---------------------------------------------------------------------------
+
+def resolve_saxs_geometry(
+    run: Any,
+    energy_kev: float | None = None,
+    **overrides: Any,
+) -> SAXSGeometry:
+    """Resolve full SAXS geometry from a tiled run.
+
+    Fallback order for each parameter:
+      1. User override (``overrides`` dict)
+      2. Primary stream (per-frame value, if field present)
+      3. Baseline stream (start-of-scan snapshot — always present)
+      4. Primary configuration metadata
+      5. Start metadata / sample_name encoding
+      6. Hardcoded instrument defaults
+    """
+    baseline = _read_baseline(run)
+    conf = _primary_conf(run, "pil2M")
+    start = run.metadata.get("start", {})
+    sample_name = start.get("sample_name", "")
+    name_geo = parse_sample_name_geometry(sample_name)
+
+    # Energy resolution: override > start metadata > baseline > sample_name > default
+    if energy_kev is None:
+        _baseline_energy_ev = _baseline_scalar(run, "energy_energy")
+        _baseline_energy_kev = (
+            _baseline_energy_ev / 1000.0 if _baseline_energy_ev is not None else None
+        )
+        energy_kev = (
+            start.get("energy")
+            or _baseline_energy_kev
+            or name_geo.get("energy_kev")
+            or DEFAULT_ENERGY_KEV
+        )
+    energy_ev = float(energy_kev) * 1000.0
+
+    # Beam center: override > baseline > primary conf > default
+    beam_row = (
+        overrides.get("beam_center_row_px")
+        or _baseline_scalar(run, "pil2M_beam_center_y_px")
+        or _dataset_scalar(baseline, "pil2M_beam_center_y_px")
+        or _conf_scalar(conf, "pil2M_beam_center_y_px")
+        or _SAXS_DEFAULT_BEAM_ROW_PX
+    )
+    beam_col = (
+        overrides.get("beam_center_col_px")
+        or _baseline_scalar(run, "pil2M_beam_center_x_px")
+        or _dataset_scalar(baseline, "pil2M_beam_center_x_px")
+        or _conf_scalar(conf, "pil2M_beam_center_x_px")
+        or _SAXS_DEFAULT_BEAM_COL_PX
+    )
+
+    # Distance: override > primary > baseline > sample_name > conf > default
+    _sdd_from_name = name_geo.get("sdd_m")
+    _sdd_from_name_mm = _sdd_from_name * 1000.0 if _sdd_from_name is not None else None
+    dist_mm = (
+        overrides.get("sample_distance_mm")
+        or _primary_scalar(run, "pil2M_motor_z")
+        or _baseline_scalar(run, "pil2M_motor_z_user_setpoint")
+        or _baseline_scalar(run, "pil2M_motor_z")
+        or _dataset_scalar(baseline, "pil2M_motor_z_user_setpoint")
+        or _dataset_scalar(baseline, "pil2M_motor_z")
+        or _conf_scalar(conf, "pil2M_sdd_mm")
+        or _sdd_from_name_mm
+        or _SAXS_DEFAULT_DISTANCE_MM
+    )
+    active_bs = (
+        overrides.get("active_beamstop")
+        or _baseline_scalar(run, "pil2M_active_beamstop")
+        or _dataset_scalar(baseline, "pil2M_active_beamstop")
+        or _conf_scalar(conf, "pil2M_active_beamstop")
+        or "rod"
+    )
+
+    bs_pos = {
+        "rod": {
+            "x": (
+                _baseline_scalar(run, "saxs_beamstop_x_rod_user_setpoint")
+                or _dataset_scalar(baseline, "saxs_beamstop_x_rod_user_setpoint")
+                or _baseline_scalar(run, "saxs_beamstop_x_rod")
+                or _dataset_scalar(baseline, "saxs_beamstop_x_rod")
+            ),
+            "y": (
+                _baseline_scalar(run, "saxs_beamstop_y_rod_user_setpoint")
+                or _dataset_scalar(baseline, "saxs_beamstop_y_rod_user_setpoint")
+                or _baseline_scalar(run, "saxs_beamstop_y_rod")
+                or _dataset_scalar(baseline, "saxs_beamstop_y_rod")
+            ),
+        },
+        "pin": {
+            "x": (
+                _baseline_scalar(run, "saxs_beamstop_x_pin_user_setpoint")
+                or _dataset_scalar(baseline, "saxs_beamstop_x_pin_user_setpoint")
+                or _baseline_scalar(run, "saxs_beamstop_x_pin")
+                or _dataset_scalar(baseline, "saxs_beamstop_x_pin")
+            ),
+            "y": (
+                _baseline_scalar(run, "saxs_beamstop_y_pin_user_setpoint")
+                or _dataset_scalar(baseline, "saxs_beamstop_y_pin_user_setpoint")
+                or _baseline_scalar(run, "saxs_beamstop_y_pin")
+                or _dataset_scalar(baseline, "saxs_beamstop_y_pin")
+            ),
+        },
+    }
+
+    beam_row = float(beam_row)
+    beam_col = float(beam_col)
+    dist_mm  = float(dist_mm)
+
+    # Beam center pixel coordinates must be positive (they are positions on
+    # the detector image).  Some ophyd configurations store them with a
+    # spurious negative sign — take the absolute value in that case.
+    if beam_row < 0:
+        beam_row = abs(beam_row)
+    if beam_col < 0:
+        beam_col = abs(beam_col)
+
+    # --- Motor-driven beam center & SDD corrections -------------------------
+    # Read pil2M_motor_x, pil2M_motor_y, piezo_z (primary → baseline) and
+    # offset the reference beam center / distance accordingly.  When motors
+    # are scanned (in primary), this uses the first-frame value as the
+    # reference; per-frame variation is exposed as coords on the DataArray.
+    motor_x_mm = _read_first_scalar(
+        run, "pil2M_motor_x", baseline_keys=("pil2M_motor_x_user_setpoint", "pil2M_motor_x"),
+        baseline_ds=baseline,
+    )
+    motor_y_mm = _read_first_scalar(
+        run, "pil2M_motor_y", baseline_keys=("pil2M_motor_y_user_setpoint", "pil2M_motor_y"),
+        baseline_ds=baseline,
+    )
+    motor_z_mm = _read_first_scalar(
+        run, "pil2M_motor_z",
+        baseline_keys=("pil2M_motor_z_user_setpoint", "pil2M_motor_z"),
+        baseline_ds=baseline,
+    )
+    piezo_z_um = _read_first_scalar(
+        run, "piezo_z", baseline_keys=("piezo_z_user_setpoint", "piezo_z"),
+        baseline_ds=baseline,
+    )
+
+    motor_x_ref_mm = float(overrides.get("motor_x_ref_mm", _SAXS_MOTOR_X_REF_MM))
+    motor_y_ref_mm = float(overrides.get("motor_y_ref_mm", _SAXS_MOTOR_Y_REF_MM))
+    motor_z_ref_mm = float(overrides.get("motor_z_ref_mm", _SAXS_MOTOR_Z_REF_MM))
+    piezo_z_ref_um = float(overrides.get("piezo_z_ref_um", _SAXS_PIEZO_Z_REF_UM))
+    col_per_mx = float(
+        overrides.get("beam_col_px_per_motor_x_mm", _SAXS_BEAM_COL_PX_PER_MOTOR_X_MM)
+    )
+    row_per_my = float(
+        overrides.get("beam_row_px_per_motor_y_mm", _SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM)
+    )
+    col_per_mz = float(
+        overrides.get("beam_col_px_per_motor_z_mm", _SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM)
+    )
+    row_per_mz = float(
+        overrides.get("beam_row_px_per_motor_z_mm", _SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM)
+    )
+    sdd_per_pz = float(
+        overrides.get("sdd_delta_mm_per_piezo_z_um", _SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM)
+    )
+
+    if motor_x_mm is not None:
+        beam_col += (motor_x_mm - motor_x_ref_mm) * col_per_mx
+    if motor_y_mm is not None:
+        beam_row += (motor_y_mm - motor_y_ref_mm) * row_per_my
+    if motor_z_mm is not None:
+        beam_col += (motor_z_mm - motor_z_ref_mm) * col_per_mz
+        beam_row += (motor_z_mm - motor_z_ref_mm) * row_per_mz
+    if piezo_z_um is not None:
+        dist_mm += (piezo_z_um - piezo_z_ref_um) * sdd_per_pz
+
+    # Apply additive distance correction (default from calibration; overridable)
+    dist_delta_mm = float(
+        overrides.get("distance_delta_mm", _SAXS_DEFAULT_DISTANCE_DELTA_MM)
+    )
+    dist_mm += dist_delta_mm
+
+    # Apply additive beam-center corrections on top of metadata values
+    beam_row += float(
+        overrides.get("beam_delta_row_px", _SAXS_DEFAULT_BEAM_DELTA_ROW_PX)
+    )
+    beam_col += float(
+        overrides.get("beam_delta_col_px", _SAXS_DEFAULT_BEAM_DELTA_COL_PX)
+    )
+
+    return SAXSGeometry(
+        dist_m=dist_mm / 1000.0,
+        poni1_m=beam_row * PILATUS_PIXEL_SIZE_M,
+        poni2_m=beam_col * PILATUS_PIXEL_SIZE_M,
+        energy_ev=energy_ev,
+        wavelength_m=_energy_to_wavelength_m(energy_ev),
+        beam_center_row_px=beam_row,
+        beam_center_col_px=beam_col,
+        active_beamstop=str(active_bs),
+        beamstop_pos_mm=bs_pos,
+        motor_x_mm=motor_x_mm,
+        motor_y_mm=motor_y_mm,
+        motor_z_mm=motor_z_mm,
+        piezo_z_um=piezo_z_um,
+    )
+
+
+def resolve_waxs_geometry(
+    run: Any,
+    energy_kev: float | None = None,
+    **overrides: Any,
+) -> WAXSGeometry:
+    """Resolve full WAXS geometry from a tiled run.
+
+    Fallback order for each parameter:
+      1. User override (``overrides`` dict)
+      2. Primary stream (per-frame value, if field present)
+      3. Baseline stream (start-of-scan snapshot — always present)
+      4. Primary configuration metadata
+      5. Start metadata / sample_name encoding
+      6. Hardcoded instrument defaults
+    """
+    baseline = _read_baseline(run)
+    conf = _primary_conf(run, "pil900KW")
+    start = run.metadata.get("start", {})
+    sample_name = start.get("sample_name", "")
+    name_geo = parse_sample_name_geometry(sample_name)
+
+    # Energy resolution: override > start metadata > baseline > sample_name > default
+    if energy_kev is None:
+        _baseline_energy_ev = _baseline_scalar(run, "energy_energy")
+        _baseline_energy_kev = (
+            _baseline_energy_ev / 1000.0 if _baseline_energy_ev is not None else None
+        )
+        energy_kev = (
+            start.get("energy")
+            or _baseline_energy_kev
+            or name_geo.get("energy_kev")
+            or DEFAULT_ENERGY_KEV
+        )
+    energy_ev = float(energy_kev) * 1000.0
+
+    dist_mm = (
+        overrides.get("sample_distance_mm")
+        or _primary_scalar(run, "pil900KW_motor_z")
+        or _baseline_scalar(run, "pil900KW_motor_z_user_setpoint")
+        or _baseline_scalar(run, "pil900KW_motor_z")
+        or _dataset_scalar(baseline, "pil900KW_motor_z_user_setpoint")
+        or _dataset_scalar(baseline, "pil900KW_motor_z")
+        or _conf_scalar(conf, "pil900KW_sdd_mm")
+        or _WAXS_DEFAULT_DISTANCE_MM
+    )
+    # NOTE: The ophyd configuration stores WAXS beam center in the raw
+    # (un-rotated) image frame, which is incompatible with the rotated
+    # coordinate system used by WAXSCalibration / MultiPanelArcDetector.
+    # Always use the calibrated defaults as the base; fine-tune via deltas.
+    beam_row = float(
+        overrides.get("beam_center_row_px")
+        or _WAXS_DEFAULT_BEAM_ROW_PX
+    )
+    beam_col = float(
+        overrides.get("beam_center_col_px")
+        or _WAXS_DEFAULT_BEAM_COL_PX
+    )
+
+    # Apply additive beam-center corrections on top of metadata values
+    beam_row += float(
+        overrides.get("beam_delta_row_px", _WAXS_DEFAULT_BEAM_DELTA_ROW_PX)
+    )
+    beam_col += float(
+        overrides.get("beam_delta_col_px", _WAXS_DEFAULT_BEAM_DELTA_COL_PX)
+    )
+
+    panel_offsets = overrides.get(
+        "panel_offsets_deg", _WAXS_DEFAULT_PANEL_OFFSETS_DEG
+    )
+    panel_cols = overrides.get(
+        "panel_col_ranges", _WAXS_DEFAULT_PANEL_COL_RANGES
+    )
+    panels = tuple(
+        WAXSPanelGeometry(
+            col_start=int(c0),
+            col_end=int(c1),
+            offset_deg=float(off),
+        )
+        for (c0, c1), off in zip(panel_cols, panel_offsets)
+    )
+
+    return WAXSGeometry(
+        dist_m=float(dist_mm) / 1000.0,
+        beam_center_row_px=beam_row,
+        beam_center_col_px=beam_col,
+        energy_ev=energy_ev,
+        wavelength_m=_energy_to_wavelength_m(energy_ev),
+        theta_zero_deg=float(overrides.get("theta_zero_deg", 0.0)),
+        sample_offset_x_mm=float(overrides.get("sample_offset_x_mm", 0.0)),
+        sample_offset_z_mm=float(overrides.get("sample_offset_z_mm", 0.0)),
+        panels=panels,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Image loading from Tiled
+# ---------------------------------------------------------------------------
+
+def _get_primary_field_node(run: Any, field: str) -> Any:
+    """Return the tiled ArrayClient (or xarray-like) node for a primary field.
+
+    Avoids calling ``run["primary"].read()`` which would pull every variable
+    in the primary stream over the network.  Tries the common bluesky/tiled
+    layouts (``primary/data/<field>`` then ``primary/<field>``).
+    """
+    primary = run["primary"]
+    # Modern bluesky-tiled layout: primary -> data -> <field>
+    try:
+        data_node = primary["data"]
+    except Exception:
+        data_node = None
+    if data_node is not None:
+        try:
+            return data_node[field]
+        except Exception:
+            pass
+    # Fallback: field hangs directly off primary
+    try:
+        return primary[field]
+    except Exception as exc:  # pragma: no cover - defensive
+        raise KeyError(
+            f"Field '{field}' not found in primary stream of run."
+        ) from exc
+
+
+# Tiled chunks larger than this estimated byte size are pre-emptively read
+# frame-by-frame instead of as a single bulk request.  The SMI ``pil2M_image``
+# field is chunked at ~99 MB per chunk, which the tiled server has been
+# observed to reject with HTTP 500 even when smaller chunks (e.g. the WAXS
+# ``pil900KW_image`` at ~36 MB per chunk) succeed.  Threshold is intentionally
+# conservative; the per-frame fallback path is reliable but slower.
+_BULK_READ_MAX_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+# How many times to retry a single per-frame read on a transient server error
+# before giving up.  Backoff is linear: 1s, 2s, 3s, ...
+_PER_FRAME_RETRIES = 4
+
+
+def _estimate_max_chunk_bytes(node: Any) -> int | None:
+    """Return the byte size of the largest tiled chunk for ``node``, or None.
+
+    Uses ``node.chunks`` (tuple of per-axis chunk-size tuples) and ``dtype``
+    if available.  Returns ``None`` when the information is missing so the
+    caller can fall back to a bulk read.
+    """
+    chunks = getattr(node, "chunks", None)
+    dtype = getattr(node, "dtype", None)
+    if not chunks or dtype is None:
+        return None
+    try:
+        itemsize = int(np.dtype(dtype).itemsize)
+        # Largest chunk along each axis multiplied together
+        max_elems = 1
+        for axis_chunks in chunks:
+            if not axis_chunks:
+                return None
+            max_elems *= int(max(axis_chunks))
+        return max_elems * itemsize
+    except Exception:
+        return None
+
+
+def _read_array_via_http_full(node: Any) -> np.ndarray | None:
+    """Fetch an entire tiled array via the raw ``/array/full`` endpoint.
+
+    Bypasses the tiled client's slice serialiser (which in v0.2.x emits
+    ``?slice=:N:1,:M:1,:K:1`` with explicit strides on every axis — a form
+    the production NSLS-II tiled server rejects with HTTP 500).  Issuing
+    the request with no ``slice`` query parameter at all asks for the
+    whole array and works regardless of client version.
+
+    Returns ``None`` if the node does not expose enough metadata to use
+    this fast-path so the caller can fall back to ``node.read()``.
+    """
+    item = getattr(node, "item", None)
+    links = (item or {}).get("links") or {}
+    full_url = links.get("full")
+    http_client = None
+    ctx = getattr(node, "context", None)
+    if ctx is not None:
+        http_client = getattr(ctx, "http_client", None)
+    dtype = getattr(node, "dtype", None)
+    shape = getattr(node, "shape", None)
+    if not full_url or http_client is None or dtype is None or shape is None:
+        return None
+
+    resp = http_client.get(
+        full_url,
+        params={"format": "application/octet-stream"},
+        headers={"Accept": "application/octet-stream"},
+        timeout=300.0,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"tiled /array/full returned HTTP {resp.status_code}: "
+            f"{resp.text[:200]}"
+        )
+    return _decode_array_response(
+        resp.content, dtype, tuple(int(s) for s in shape),
+    )
+
+
+def _decode_array_response(content: bytes, dtype: Any, shape: tuple[int, ...]) -> np.ndarray:
+    """Reconstruct a numpy array from a tiled ``/array/full`` response body."""
+    return np.frombuffer(content, dtype=np.dtype(dtype)).reshape(shape)
+
+
+def _read_one_frame_via_http(node: Any, i: int) -> np.ndarray | None:
+    """Fetch a single frame using the raw ``/array/full`` HTTP endpoint.
+
+    Works around a serialisation incompatibility in newer ``tiled`` clients
+    (>=0.2): they format slices as ``?slice=:1:1,:N:1,:M:1`` (with explicit
+    strides on every axis), which the production NSLS-II tiled server
+    rejects with HTTP 500.  The plain ``?slice=i:i+1,:,:`` form works.
+
+    Returns ``None`` if the node does not expose enough metadata to use
+    this fast-path, so the caller can fall back to the high-level client.
+    """
+    item = getattr(node, "item", None)
+    links = (item or {}).get("links") or {}
+    full_url = links.get("full")
+    http_client = None
+    ctx = getattr(node, "context", None)
+    if ctx is not None:
+        http_client = getattr(ctx, "http_client", None)
+    dtype = getattr(node, "dtype", None)
+    shape = getattr(node, "shape", None)
+    if not full_url or http_client is None or dtype is None or shape is None:
+        return None
+    if len(shape) < 1:
+        return None
+
+    # Build a slice spec the tiled server accepts: ``i:i+1`` on the leading
+    # axis, plain ``:`` on every other axis, no strides.
+    slice_parts = [f"{i}:{i + 1}"] + [":"] * (len(shape) - 1)
+    slice_spec = ",".join(slice_parts)
+
+    resp = http_client.get(
+        full_url,
+        params={"slice": slice_spec, "format": "application/octet-stream"},
+        headers={"Accept": "application/octet-stream"},
+        timeout=120.0,
+    )
+    if resp.status_code != 200:
+        # Surface the error so the caller's retry loop can see it.
+        raise RuntimeError(
+            f"tiled /array/full returned HTTP {resp.status_code} for "
+            f"frame {i}: {resp.text[:200]}"
+        )
+    frame_shape = (1, *tuple(int(s) for s in shape[1:]))
+    return _decode_array_response(resp.content, dtype, frame_shape)
+
+
+def _read_one_frame_with_retry(node: Any, i: int) -> np.ndarray:
+    """Read frame ``i`` from ``node`` with retries for transient failures."""
+    last_exc: Exception | None = None
+    for attempt in range(_PER_FRAME_RETRIES):
+        # Preferred path: raw HTTP with a server-friendly slice spec.
+        # This avoids the tiled>=0.2 client bug where slices on multi-dim
+        # arrays are serialised as ``:1:1,:N:1,:M:1`` (which the NSLS-II
+        # tiled server rejects with HTTP 500).
+        try:
+            frame = _read_one_frame_via_http(node, i)
+            if frame is not None:
+                return frame
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+
+        # Fallback 1: high-level client indexing.
+        try:
+            return np.asarray(node[i : i + 1])
+        except Exception as exc:  # noqa: BLE001 - tiled error types vary
+            last_exc = exc
+
+        # Fallback 2: ``read(slice=...)`` for clients without __getitem__.
+        try:
+            return np.asarray(node.read(slice=(slice(i, i + 1),)))
+        except Exception as exc2:  # noqa: BLE001
+            last_exc = exc2
+
+        if attempt < _PER_FRAME_RETRIES - 1:
+            time.sleep(1.0 * (attempt + 1))
+    # Exhausted retries
+    assert last_exc is not None
+    raise last_exc
+
+
+def _read_array_chunked(node: Any, parallel: bool = True, max_workers: int | None = None) -> np.ndarray:
+    """Read a tiled array node frame-by-frame to avoid server-side 500s.
+
+    The tiled server can return HTTP 500 when asked for a large multi-frame
+    detector image in a single request.  Reading one frame at a time keeps
+    each request small and works around the issue.  Falls back to a single
+    ``read()`` for nodes that do not support indexed access.
+
+    Parameters
+    ----------
+    node : tiled ArrayClient
+        The tiled node to read from.
+    parallel : bool
+        If True (default), fetch frames concurrently using threads.
+        Each frame is an independent HTTP request, so thread-based
+        parallelism yields significant speedups on multi-frame scans.
+    max_workers : int | None
+        Maximum number of concurrent threads.  Defaults to min(n_frames, 8).
+    """
+    # Determine the leading dimension length
+    shape = getattr(node, "shape", None)
+    if shape is None or len(shape) == 0:
+        return np.asarray(node.read())
+
+    n = int(shape[0])
+    if n == 0:
+        return np.asarray(node.read())
+
+    if parallel and n > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        workers = max_workers if max_workers is not None else min(n, 8)
+        frames = [None] * n
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {
+                executor.submit(_read_one_frame_with_retry, node, i): i
+                for i in range(n)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                frames[idx] = future.result()
+        return np.concatenate(frames, axis=0)
+
+    frames: list[np.ndarray] = []
+    for i in range(n):
+        frames.append(_read_one_frame_with_retry(node, i))
+    return np.concatenate(frames, axis=0)
+
+
+def _read_primary_field(run: Any, field: str) -> np.ndarray:
+    """Read a single primary-stream field as a numpy array.
+
+    Attempts a single bulk read first; on HTTP/server errors falls back to
+    a frame-by-frame chunked read so that large detector arrays still load
+    successfully when the tiled backend rejects an "all at once" request.
+    """
+    node = _get_primary_field_node(run, field)
+
+    # Pre-emptively skip the bulk read for nodes whose tiled chunks exceed
+    # the size threshold the server has been observed to reject.  The SMI
+    # SAXS ``pil2M_image`` falls in this category; WAXS ``pil900KW_image``
+    # does not.
+    max_chunk_bytes = _estimate_max_chunk_bytes(node)
+    skip_bulk = (
+        max_chunk_bytes is not None
+        and max_chunk_bytes > _BULK_READ_MAX_CHUNK_BYTES
+    )
+
+    arr: np.ndarray
+    if skip_bulk:
+        arr = _read_array_chunked(node)
+    else:
+        # Preferred bulk path: raw HTTP to the ``/array/full`` endpoint.
+        # Avoids the tiled>=0.2 slice-serialisation bug that otherwise
+        # makes ``node.read()`` 500 against the NSLS-II tiled server.
+        arr = None  # type: ignore[assignment]
+        try:
+            arr = _read_array_via_http_full(node)
+        except Exception:  # noqa: BLE001
+            arr = None
+        if arr is None:
+            try:
+                # Tiled ArrayClient — supports .read() returning a numpy array
+                if hasattr(node, "read"):
+                    raw = node.read()
+                else:
+                    raw = node[...]
+                arr = np.asarray(raw)
+            except Exception:  # noqa: BLE001 - tiled/httpx error types vary
+                # Any failure during the bulk read (HTTP 500, dask compute
+                # failure that wraps a server error, transient network blip,
+                # etc.) — retry by streaming one frame at a time.  The
+                # chunked path itself retries individual frames.
+                arr = _read_array_chunked(node)
+
+    # Tiled may return 4-D: (primary_step, exposures, row, col).
+    # Average over the exposures axis to get (step, row, col).
+    if arr.ndim == 4:
+        arr = np.nanmean(arr, axis=1)
+    return arr
+
+
+def _has_primary_field(run: Any, field: str) -> bool:
+    """Return True if the given field exists in the primary stream.
+
+    Uses tiled container introspection to avoid downloading the entire
+    primary stream just to check for a field's presence.
+    """
+    try:
+        primary = run["primary"]
+    except Exception:
+        return False
+    # Try modern bluesky-tiled layout first: primary/data/<field>
+    try:
+        data_node = primary["data"]
+        if field in list(data_node):
+            return True
+    except Exception:
+        pass
+    # Fallback: field directly under primary
+    try:
+        return field in list(primary)
+    except Exception:
+        pass
+    # Last-resort: full read (slow but correct)
+    try:
+        ds = primary.read()
+        return field in ds
+    except Exception:
+        return False
+
+
+def _read_scan_axis(run: Any, field: str, cache_path: str | Path | None = None) -> np.ndarray | None:
+    """Read a motor field from primary; fall back to other sources if absent.
+
+    Fallback order:
+      0. HDF5 disk cache (if cache_path provided and field is present)
+      1. Primary stream data fields (per-frame values — when motor is scanned)
+      2. Primary/internal stream (per-frame values from non-scanned signals)
+      3. target_file_name parsing from primary/internal (per-frame encoded)
+      4. Baseline stream via efficient per-column access (new tiled layout)
+      5. Baseline stream via full xr.Dataset read (old tiled layout)
+      6. Sample name parsing from start document (last resort)
+
+    Reads only the requested field directly from tiled (avoids pulling the
+    full primary stream, which contains the multi-GB detector arrays).
+    """
+    # 0. HDF5 disk cache
+    if cache_path is not None:
+        cached = _read_cached_primary_field(cache_path, field)
+        if cached is not None:
+            try:
+                return np.asarray(cached, dtype=float)
+            except (ValueError, TypeError):
+                pass
+
+    # 1. Primary stream data fields (per-frame varying values)
+    if _has_primary_field(run, field):
+        try:
+            node = _get_primary_field_node(run, field)
+            values = node.read() if hasattr(node, "read") else node[...]
+            arr = np.asarray(values, dtype=float)
+            # Reorder to chronological seq_num order so the array aligns
+            # with the (chronological) image stack.  No-op when the table
+            # is already monotonic or the shape doesn't match.
+            return _apply_primary_sort(arr, run)
+        except Exception:
+            pass
+
+    # 2. Primary/internal stream (per-frame signals not in data/)
+    if _has_primary_internal_field(run, field):
+        try:
+            arr = _read_primary_internal_array(run, field)
+            if arr is not None and arr.size > 0:
+                return _apply_primary_sort(
+                    np.asarray(arr, dtype=float), run,
+                )
+        except (ValueError, TypeError):
+            # Field exists but is non-numeric (e.g. target_file_name) — skip
+            pass
+
+    # 3. target_file_name parsing (per-frame geometry encoded in filenames)
+    _TFN_FIELD_MAP = {
+        WAXS_ARC_FIELD: "waxs_arc_deg",
+        "energy_energy": "energy_kev",  # returns keV, caller converts
+    }
+    if field in _TFN_FIELD_MAP:
+        tfn_geo = _read_target_file_name_geometry(run)
+        if tfn_geo is not None:
+            geo_key = _TFN_FIELD_MAP[field]
+            values = []
+            for frame_geo in tfn_geo:
+                v = frame_geo.get(geo_key)
+                if v is None:
+                    break
+                values.append(v)
+            if len(values) == len(tfn_geo) and len(values) > 0:
+                arr = np.array(values, dtype=float)
+                # Convert energy_kev back to eV for energy_energy field
+                if field == "energy_energy" and geo_key == "energy_kev":
+                    arr = arr * 1000.0
+                return arr
+
+    # 4. Baseline stream (efficient per-column path)
+    val = _baseline_scalar(run, field)
+    if val is not None:
+        return np.array([float(val)], dtype=float)
+
+    # 5. Baseline via full xr.Dataset (legacy fallback)
+    baseline = _read_baseline(run)
+    val = _dataset_scalar(baseline, field)
+    if val is not None:
+        return np.array([float(val)], dtype=float)
+
+    # 6. Sample name parsing (last resort)
+    _SAMPLE_NAME_FIELD_MAP = {
+        WAXS_ARC_FIELD: "waxs_arc_deg",
+    }
+    if field in _SAMPLE_NAME_FIELD_MAP:
+        start = run.metadata.get("start", {})
+        name_geo = parse_sample_name_geometry(start.get("sample_name", ""))
+        val = name_geo.get(_SAMPLE_NAME_FIELD_MAP[field])
+        if val is not None:
+            return np.array([float(val)], dtype=float)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Public loader: SAXS
+# ---------------------------------------------------------------------------
+
+def load_saxs_raw(
+    run: Any,
+    geo: SAXSGeometry,
+    extra_attrs: dict[str, Any] | None = None,
+    image_cache_path: str | Path | None = None,
+) -> xr.DataArray:
+    """
+    Load SAXS (Pilatus 2M) raw images from a tiled run as an xr.DataArray.
+
+    Parameters
+    ----------
+    image_cache_path : str, Path, or None
+        If given, attempt to read images from this HDF5 cache file before
+        falling back to tiled.
+
+    Returns
+    -------
+    xr.DataArray
+        dims: (frame, pix_y, pix_x)  or (pix_y, pix_x) if single frame.
+        attrs: PyHyperScattering-compatible geometry + SMI-specific extras.
+    """
+    images = None
+    _t_img = time.perf_counter()
+    if image_cache_path is not None:
+        images = _read_cached_images(image_cache_path, SAXS_IMAGE_FIELD)
+    if images is not None:
+        _dt = time.perf_counter() - _t_img
+        print(f"[SMILoader] SAXS images loaded from cache in {_dt:.3f}s "
+              f"(shape={images.shape})")
+    else:
+        images = _read_primary_field(run, SAXS_IMAGE_FIELD)
+        _dt = time.perf_counter() - _t_img
+        print(f"[SMILoader] SAXS images loaded from tiled in {_dt:.3f}s "
+              f"(shape={images.shape})")
+    start = run.metadata.get("start", {})
+    sample_name = start.get("sample_name", "")
+    name_geo = parse_sample_name_geometry(sample_name)
+
+    # Resolve incident angle: primary > baseline > sample_name
+    incident_angle_deg = (
+        _primary_scalar(run, "stage_th")
+        or _baseline_scalar(run, "stage_th")
+        or name_geo.get("incident_angle_deg")
+        or name_geo.get("theta_deg")
+    )
+
+    attrs: dict[str, Any] = {
+        # PyHyperScattering / pyFAI geometry contract
+        "dist":       geo.dist_m,
+        "poni1":      geo.poni1_m,
+        "poni2":      geo.poni2_m,
+        "rot1":       geo.rot1,
+        "rot2":       geo.rot2,
+        "rot3":       geo.rot3,
+        "pixel1":     geo.pixel1_m,
+        "pixel2":     geo.pixel2_m,
+        "energy":     geo.energy_ev,
+        # Ångstroms — required by SMISWAXSIntegrator.integrate_saxs which
+        # reads this attr and converts (× 1e-10) to metres.  Note: this
+        # differs from SST1RSoXSLoader which stores wavelength in metres;
+        # PFGeneralIntegrator derives wavelength from `energy` and doesn't
+        # care which unit is stored here, but SMISWAXSIntegrator does.
+        "wavelength": geo.wavelength_m * 1e10,
+        # SMI-specific
+        "smi_detector":           "saxs_pil2M",
+        "smi_energy_kev":         geo.energy_ev / 1000.0,
+        "smi_beam_center_row_px": geo.beam_center_row_px,
+        "smi_beam_center_col_px": geo.beam_center_col_px,
+        "smi_sample_distance_mm": geo.dist_m * 1000.0,
+        "smi_active_beamstop":    geo.active_beamstop,
+        "smi_incident_angle_deg": incident_angle_deg,
+        # Run identity
+        "uid":         start.get("uid", ""),
+        "scan_id":     start.get("scan_id"),
+        "sample_name": start.get("sample_name", ""),
+    }
+    if extra_attrs:
+        attrs.update(extra_attrs)
+    # Drop None-valued attrs so the DataArray is netCDF/Zarr/Tiled
+    # serializable (those backends reject None in attrs).
+    attrs = {k: v for k, v in attrs.items() if v is not None}
+
+    # Squeeze singleton dimensions (e.g. (120, 1, 619, 1475) -> (120, 619, 1475))
+    images = np.squeeze(images)
+    if images.ndim == 2:
+        return xr.DataArray(images, dims=["pix_y", "pix_x"], attrs=attrs)
+
+    # Flatten leading dimensions into frames; last two are always (pix_y, pix_x)
+    if images.ndim > 3:
+        orig_shape = images.shape
+        images = images.reshape(-1, *images.shape[-2:])
+        print(f"[SMILoader] SAXS images reshaped from {orig_shape} to {images.shape}")
+    if images.ndim != 3:
+        raise ValueError(
+            f"Expected 2-D or 3-D SAXS image array, got {images.ndim}-D "
+            f"with shape {images.shape}"
+        )
+    n_frames = images.shape[0]
+    arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD, cache_path=image_cache_path)
+    if arc_angles is not None and arc_angles.shape[0] == n_frames:
+        frame_coord = arc_angles
+        frame_dim_name = WAXS_ARC_FIELD
+    else:
+        frame_coord = np.arange(n_frames)
+        frame_dim_name = "frame"
+
+    coords: dict[str, Any] = {frame_dim_name: frame_coord}
+    # Attach per-frame motor positions when they vary across the scan.  These
+    # let downstream code compute per-frame beam center / SDD via the same
+    # offsets that resolve_saxs_geometry applies to the reference frame.
+    for motor_name in ("pil2M_motor_x", "pil2M_motor_y",
+                       "pil2M_motor_z", "piezo_z"):
+        arr = _read_scan_axis(run, motor_name, cache_path=image_cache_path)
+        if arr is None or arr.size == 0:
+            continue
+        if arr.shape[0] == n_frames:
+            coords[motor_name] = (frame_dim_name, arr.astype(float))
+
+    return xr.DataArray(
+        images,
+        dims=[frame_dim_name, "pix_y", "pix_x"],
+        coords=coords,
+        attrs=attrs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public loader: WAXS
+# ---------------------------------------------------------------------------
+
+def load_waxs_raw(
+    run: Any,
+    geo: WAXSGeometry,
+    extra_attrs: dict[str, Any] | None = None,
+    image_cache_path: str | Path | None = None,
+) -> xr.DataArray:
+    """
+    Load WAXS (900KW) raw images from a tiled run as an xr.DataArray.
+
+    .. warning::
+       The returned DataArray's geometry attrs (``dist, poni1, poni2``, …)
+       describe only the **centre panel** of the 3-panel folded arc, and the
+       off-centre panels are physically tilted ±7° out of that plane.  Passing
+       this DataArray to ``PFGeneralIntegrator`` (which assumes a single flat
+       detector) will silently produce incorrect q-values for the outer
+       panels.  Always integrate WAXS via
+       :class:`smi_tiled.integrator.SMISWAXSIntegrator` or
+       :func:`smi_tiled.integrator.reduce_smi_combined`,
+       which models the panel geometry exactly via ``MultiPanelArcDetector``.
+
+    Parameters
+    ----------
+    image_cache_path : str, Path, or None
+        If given, attempt to read images from this HDF5 cache file before
+        falling back to tiled.
+
+    Returns
+    -------
+    xr.DataArray
+        dims: (waxs_arc, pix_y, pix_x)
+        coords: waxs_arc — arc motor angles in degrees
+        attrs: PyHyperScattering-compatible geometry contract (centre panel)
+            + SMI WAXS panel geometry under ``smi_panels`` (JSON-encoded;
+            decode with ``json.loads(da.attrs['smi_panels'])``)
+    """
+    images = None
+    _t_img = time.perf_counter()
+    if image_cache_path is not None:
+        images = _read_cached_images(image_cache_path, WAXS_IMAGE_FIELD)
+    if images is not None:
+        _dt = time.perf_counter() - _t_img
+        print(f"[SMILoader] WAXS images loaded from cache in {_dt:.3f}s "
+              f"(shape={images.shape})")
+    else:
+        images = _read_primary_field(run, WAXS_IMAGE_FIELD)
+        _dt = time.perf_counter() - _t_img
+        print(f"[SMILoader] WAXS images loaded from tiled in {_dt:.3f}s "
+              f"(shape={images.shape})")
+    start  = run.metadata.get("start", {})
+    sample_name = start.get("sample_name", "")
+    name_geo = parse_sample_name_geometry(sample_name)
+
+    # Resolve incident angle: primary > baseline > sample_name
+    incident_angle_deg = (
+        _primary_scalar(run, "stage_th")
+        or _baseline_scalar(run, "stage_th")
+        or name_geo.get("incident_angle_deg")
+        or name_geo.get("theta_deg")
+    )
+
+    arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD, cache_path=image_cache_path)
+    bsx_values = _read_scan_axis(run, WAXS_BSX_FIELD, cache_path=image_cache_path)
+    energy_per_frame_ev = _read_scan_axis(run, "energy_energy", cache_path=image_cache_path)
+
+    # Squeeze singleton dimensions (e.g. (120, 1, 619, 1475) -> (120, 619, 1475))
+    images = np.squeeze(images)
+    if images.ndim == 2:
+        images = images[np.newaxis, :, :]
+    # Flatten leading dimensions into frames; last two are always (pix_y, pix_x)
+    if images.ndim > 3:
+        orig_shape = images.shape
+        images = images.reshape(-1, *images.shape[-2:])
+        print(f"[SMILoader] WAXS images reshaped from {orig_shape} to {images.shape}")
+    if images.ndim != 3:
+        raise ValueError(
+            f"Expected 2-D or 3-D WAXS image array, got {images.ndim}-D "
+            f"with shape {images.shape}"
+        )
+    n_frames = images.shape[0]
+
+    if arc_angles is None:
+        arc_angles = np.zeros(n_frames, dtype=float)
+    elif arc_angles.shape[0] == 1 and n_frames > 1:
+        arc_angles = np.full(n_frames, arc_angles[0], dtype=float)
+    elif arc_angles.shape[0] != n_frames:
+        arc_angles = np.zeros(n_frames, dtype=float)
+
+    if bsx_values is None:
+        bsx_values = np.zeros(n_frames, dtype=float)
+    elif bsx_values.shape[0] == 1 and n_frames > 1:
+        bsx_values = np.full(n_frames, bsx_values[0], dtype=float)
+    elif bsx_values.shape[0] != n_frames:
+        bsx_values = np.zeros(n_frames, dtype=float)
+
+    # Per-frame energy: expand scalar to array, or use geo default
+    if energy_per_frame_ev is None:
+        energy_per_frame_ev = np.full(n_frames, geo.energy_ev, dtype=float)
+    elif energy_per_frame_ev.shape[0] == 1 and n_frames > 1:
+        energy_per_frame_ev = np.full(n_frames, energy_per_frame_ev[0], dtype=float)
+    elif energy_per_frame_ev.shape[0] != n_frames:
+        energy_per_frame_ev = np.full(n_frames, geo.energy_ev, dtype=float)
+
+    panels_attr = [
+        {
+            "col_start":    p.col_start,
+            "col_end":      p.col_end,
+            "offset_deg":   p.offset_deg,
+            "row_shift_px": p.row_shift_px,
+            "col_shift_px": p.col_shift_px,
+        }
+        for p in geo.panels
+    ]
+
+    poni1_m = geo.beam_center_row_px * geo.pixel_m
+    poni2_m = geo.beam_center_col_px * geo.pixel_m
+
+    attrs: dict[str, Any] = {
+        # PyHyperScattering / pyFAI geometry contract (centre panel, arc=0)
+        "dist":       geo.dist_m,
+        "poni1":      poni1_m,
+        "poni2":      poni2_m,
+        "rot1":       0.0,
+        "rot2":       0.0,
+        "rot3":       0.0,
+        "pixel1":     geo.pixel_m,
+        "pixel2":     geo.pixel_m,
+        "energy":     geo.energy_ev,
+        # Ångstroms — required by SMISWAXSIntegrator (see load_saxs_raw note).
+        "wavelength": geo.wavelength_m * 1e10,
+        # SMI WAXS-specific
+        "smi_detector":              "waxs_pil900KW",
+        "smi_energy_kev":            geo.energy_ev / 1000.0,
+        "smi_beam_center_row_px":    geo.beam_center_row_px,
+        "smi_beam_center_col_px":    geo.beam_center_col_px,
+        "smi_sample_distance_mm":    geo.dist_m * 1000.0,
+        "smi_theta_zero_deg":        geo.theta_zero_deg,
+        "smi_sample_offset_x_mm":    geo.sample_offset_x_mm,
+        "smi_sample_offset_z_mm":    geo.sample_offset_z_mm,
+        "smi_rotation_k":            geo.rotation_k,
+        # smi_panels is a list of dicts (panel geometry).  Stored as a JSON
+        # string so the DataArray is round-trippable through netCDF/Zarr and
+        # Tiled, which reject nested objects in attrs.  Decode with
+        # json.loads(da.attrs['smi_panels']).
+        "smi_panels":                json.dumps(panels_attr),
+        "smi_waxs_bsx_per_frame":    bsx_values.tolist(),
+        "smi_energy_per_frame_ev":   energy_per_frame_ev.tolist(),
+        "smi_incident_angle_deg":    incident_angle_deg,
+        # Run identity
+        "uid":         start.get("uid", ""),
+        "scan_id":     start.get("scan_id"),
+        "sample_name": start.get("sample_name", ""),
+    }
+    if extra_attrs:
+        attrs.update(extra_attrs)
+    # Drop None-valued attrs so the DataArray is netCDF/Zarr/Tiled
+    # serializable (those backends reject None in attrs).
+    attrs = {k: v for k, v in attrs.items() if v is not None}
+
+    return xr.DataArray(
+        images,
+        dims=[WAXS_ARC_FIELD, "pix_y", "pix_x"],
+        coords={WAXS_ARC_FIELD: arc_angles},
+        attrs=attrs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scan info utility
+# ---------------------------------------------------------------------------
+
+def _infer_from_cache(cache_path: str | Path, start: dict) -> dict[str, Any] | None:
+    """Fast path for infer_detectors_and_steps using the HDF5 disk cache.
+
+    Returns the same dict that infer_detectors_and_steps would return,
+    or None if the cache doesn't have enough info.
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with h5py.File(cache_path, "r") as f:
+            # Collect field names from /primary and /images
+            primary_fields: list[str] = []
+            if "primary" in f:
+                primary_fields = sorted(f["primary"].keys())
+
+            image_fields: list[str] = []
+            if "images" in f:
+                image_fields = sorted(f["images"].keys())
+
+            # Build vars_all: primary scalars + image field names
+            vars_all = sorted(set(primary_fields) | set(image_fields))
+
+            # Determine n_frames from image datasets or primary arrays
+            n_frames = 0
+            for img_name in image_fields:
+                ds = f[f"images/{img_name}"]
+                if ds.ndim >= 1:
+                    n_frames = int(ds.shape[0])
+                    break
+            if n_frames == 0:
+                for pf in primary_fields:
+                    ds = f[f"primary/{pf}"]
+                    if ds.ndim == 1 and ds.shape[0] > 0:
+                        n_frames = int(ds.shape[0])
+                        break
+
+            # Build step_candidates from 1-D primary fields
+            step_candidates: list[dict[str, Any]] = []
+            for name in primary_fields:
+                ds = f[f"primary/{name}"]
+                if ds.ndim != 1:
+                    continue
+                if int(ds.shape[0]) != n_frames:
+                    continue
+                try:
+                    values = np.asarray(ds[...], dtype=float)
+                except (ValueError, TypeError):
+                    continue
+                finite = values[np.isfinite(values)]
+                unique = np.unique(finite)
+                if unique.size <= 1:
+                    continue
+                step_candidates.append(
+                    {
+                        "name": name,
+                        "n_unique": int(unique.size),
+                        "min": float(np.nanmin(values)),
+                        "max": float(np.nanmax(values)),
+                        "values": values,
+                    }
+                )
+    except Exception:
+        return None
+
+    detector_prefixes = sorted(
+        {name.split("_")[0] for name in vars_all if "_" in name}
+    )
+
+    print(f"[infer_detectors_and_steps] used HDF5 cache "
+          f"({len(primary_fields)} primary fields, "
+          f"{len(image_fields)} image fields)")
+
+    return {
+        "uid": start.get("uid"),
+        "scan_id": start.get("scan_id"),
+        "sample_name": start.get("sample_name"),
+        "n_frames": n_frames,
+        "detectors_start": start.get("detectors", []) or [],
+        "detector_prefixes_in_primary": detector_prefixes,
+        "step_candidates": step_candidates,
+        "detector_fields": {
+            "saxs": [n for n in vars_all if n.startswith("pil2M_")],
+            "waxs": [n for n in vars_all if n.startswith("pil900KW_")],
+            "scan_axes": [
+                n for n in vars_all
+                if n in {"waxs_arc", "waxs_bsx", "waxs_bsy"}
+            ],
+        },
+    }
+
+
+def infer_detectors_and_steps(
+    run: Any, primary: xr.Dataset | None = None,
+    cache_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Inspect a tiled run to determine detectors, scan axes, and frame count.
+
+    Parameters
+    ----------
+    run :
+        Bluesky/tiled run object.
+    primary : xr.Dataset, optional
+        If provided, used directly (legacy fast path for callers that already
+        have the full primary stream loaded).  When ``None`` (preferred), the
+        function introspects the tiled ``primary`` container WITHOUT calling
+        ``.read()`` on the detector image fields — only field names, shapes,
+        and 1-D scan axes are fetched, which avoids the multi-GB request that
+        can trigger an HTTP 500 from the tiled backend.
+    cache_path : str, Path, or None
+        If given, read primary scalar fields from this HDF5 cache file
+        instead of making tiled HTTP calls.
+    """
+    start = run.metadata.get("start", {})
+
+    # --- Fast path: read from HDF5 disk cache ---
+    if cache_path is not None and primary is None:
+        _cache_result = _infer_from_cache(cache_path, start)
+        if _cache_result is not None:
+            return _cache_result
+
+    if primary is not None:
+        vars_all = sorted(map(str, primary.data_vars.keys()))
+
+        first_dim = next(iter(primary.dims), None)
+        n_frames = (
+            int(primary.sizes.get(first_dim, 0)) if first_dim is not None else 0
+        )
+        if n_frames == 0 and vars_all:
+            first_var = primary[vars_all[0]]
+            n_frames = int(first_var.shape[0]) if first_var.ndim > 0 else 1
+
+        step_candidates: list[dict[str, Any]] = []
+        for name in vars_all:
+            da = primary[name]
+            if da.ndim != 1:
+                continue
+            if int(da.shape[0]) != n_frames:
+                continue
+            if not np.issubdtype(da.dtype, np.number):
+                continue
+            values = np.asarray(da.values, dtype=float)
+            finite = values[np.isfinite(values)]
+            unique = np.unique(finite)
+            if unique.size <= 1:
+                continue
+            step_candidates.append(
+                {
+                    "name": name,
+                    "n_unique": int(unique.size),
+                    "min": float(np.nanmin(values)),
+                    "max": float(np.nanmax(values)),
+                    "values": values,
+                }
+            )
+    else:
+        # Tiled-introspection path — no bulk reads of detector arrays.
+        _t_ids = time.perf_counter()
+        try:
+            primary_node = run["primary"]
+        except Exception:
+            primary_node = None
+
+        # Modern bluesky-tiled layout: primary -> data -> <field>
+        data_node = None
+        if primary_node is not None:
+            try:
+                data_node = primary_node["data"]
+            except Exception:
+                data_node = None
+        field_container = data_node if data_node is not None else primary_node
+
+        vars_all: list[str] = []
+        if field_container is not None:
+            try:
+                vars_all = sorted(map(str, list(field_container)))
+            except Exception:
+                vars_all = []
+        print(f"[infer_detectors_and_steps] list fields ({len(vars_all)}): "
+              f"{time.perf_counter() - _t_ids:.3f}s")
+
+        def _shape_of(name: str) -> tuple[int, ...]:
+            try:
+                node = field_container[name]
+            except Exception:
+                return ()
+            shape = getattr(node, "shape", None)
+            if shape is None:
+                try:
+                    shape = node.structure().shape  # tiled ArrayClient
+                except Exception:
+                    shape = ()
+            return tuple(int(s) for s in shape) if shape else ()
+
+        # Determine n_frames from the first array-like field with a
+        # leading dimension.  Avoids reading detector data.
+        _t_ids = time.perf_counter()
+        n_frames = 0
+        for name in vars_all:
+            shp = _shape_of(name)
+            if shp:
+                n_frames = int(shp[0])
+                break
+        print(f"[infer_detectors_and_steps] n_frames detection: "
+              f"{time.perf_counter() - _t_ids:.3f}s")
+
+        _t_ids = time.perf_counter()
+        _n_shape_checks = 0
+        _n_reads = 0
+        step_candidates: list[dict[str, Any]] = []
+        for name in vars_all:
+            shp = _shape_of(name)
+            _n_shape_checks += 1
+            if len(shp) != 1 or shp[0] != n_frames:
+                continue
+            try:
+                node = field_container[name]
+                values = np.asarray(
+                    node.read() if hasattr(node, "read") else node[...],
+                    dtype=float,
+                )
+                _n_reads += 1
+            except Exception:
+                continue
+            finite = values[np.isfinite(values)]
+            unique = np.unique(finite)
+            if unique.size <= 1:
+                continue
+            step_candidates.append(
+                {
+                    "name": name,
+                    "n_unique": int(unique.size),
+                    "min": float(np.nanmin(values)),
+                    "max": float(np.nanmax(values)),
+                    "values": values,
+                }
+            )
+        print(f"[infer_detectors_and_steps] step_candidates loop "
+              f"({_n_shape_checks} shape checks, {_n_reads} reads): "
+              f"{time.perf_counter() - _t_ids:.3f}s")
+
+    detector_prefixes = sorted(
+        {name.split("_")[0] for name in vars_all if "_" in name}
+    )
+
+    return {
+        "uid": start.get("uid"),
+        "scan_id": start.get("scan_id"),
+        "sample_name": start.get("sample_name"),
+        "n_frames": n_frames,
+        "detectors_start": start.get("detectors", []) or [],
+        "detector_prefixes_in_primary": detector_prefixes,
+        "step_candidates": step_candidates,
+        "detector_fields": {
+            "saxs": [n for n in vars_all if n.startswith("pil2M_")],
+            "waxs": [n for n in vars_all if n.startswith("pil900KW_")],
+            "scan_axes": [
+                n for n in vars_all
+                if n in {"waxs_arc", "waxs_bsx", "waxs_bsy"}
+            ],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Top-level loader class
+# ---------------------------------------------------------------------------
+
+class TiledSMISWAXSLoader:
+    """
+    Tiled-based loader for the SMI WAXS + SAXS instrument.
+
+    Indexed by run UID against a Tiled catalog (e.g. ``smi/migration`` at
+    ``tiled.nsls2.bnl.gov``).  Returns ``xr.DataArray`` objects carrying
+    the pyFAI/PyHyperScattering geometry attrs (``dist, poni1, poni2,
+    pixel1, pixel2, energy, wavelength``) — see "Compatibility" below.
+
+    Public entry points
+    -------------------
+    * ``loadSingleImage(uid, detector='saxs' | 'waxs', ...)`` — load one run
+    * ``loadRun(uid, ...)`` — load both detectors at once
+    * ``searchCatalog(...)`` / ``browseCatalog(...)`` — discover runs
+
+    Compatibility with PyHyperScattering integrators
+    ------------------------------------------------
+    Although ``smi-tiled`` does not depend on PyHyperScattering at
+    runtime, the SAXS DataArrays it emits follow the same geometry-attr
+    convention so users who *also* have PyHyperScattering installed can
+    pipe SAXS frames through their existing tooling:
+
+    * **SAXS** raw DataArrays (dims ``['pix_y', 'pix_x']`` or
+      ``['frame', 'pix_y', 'pix_x']``) carry the full geometry
+      contract and can be passed directly to
+      ``PFGeneralIntegrator(geomethod='template_xr')``.
+
+    * **WAXS** raw DataArrays (dims ``['waxs_arc', 'pix_y', 'pix_x']``)
+      describe a 3-panel folded arc detector whose geometry cannot be
+      modeled with the single flat-panel pyFAI assumption used by
+      ``PFGeneralIntegrator``.  Always use this package's own
+      :func:`smi_tiled.integrator.reduce_smi_combined` for WAXS reduction.
+
+    Parameters
+    ----------
+    tiled_uri : str
+        Tiled server base URI.
+    catalog : str
+        Slash-separated catalog path, e.g. ``"smi/migration"``.
+    energy_kev : float | None
+        Override photon energy (keV).  Falls back to run metadata.
+    """
+
+    md_loading_is_quick = True
+
+    def __init__(
+        self,
+        tiled_uri: str = DEFAULT_TILED_URI,
+        catalog: str = DEFAULT_CATALOG,
+        energy_kev: float | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self.tiled_uri = tiled_uri
+        self.catalog = catalog
+        self.energy_kev = energy_kev
+        self.api_key = api_key
+        self._root_client = None
+        self._catalog_client = None
+
+    # ------------------------------------------------------------------
+    # Authentication helpers
+    # ------------------------------------------------------------------
+    def _get_root_client(self) -> Any:
+        """Return the cached root tiled client, creating it on first use."""
+        if self._root_client is None:
+            from tiled.client import from_uri
+            kwargs: dict[str, Any] = {}
+            if self.api_key is not None:
+                kwargs["api_key"] = self.api_key
+            self._root_client = from_uri(self.tiled_uri, **kwargs)
+        return self._root_client
+
+    def login(self, **kwargs: Any) -> Any:
+        """Interactively log in to the tiled server.
+
+        Equivalent to ``tiled.client.from_uri(uri).login()``.  Any keyword
+        arguments are forwarded to the underlying tiled client's ``login``
+        method (e.g. ``provider=...``).  After a successful login the
+        catalog client is invalidated so the next access uses the
+        authenticated session.
+        """
+        client = self._get_root_client()
+        result = client.login(**kwargs)
+        # Force re-resolution of the catalog through the now-authenticated
+        # root client so subsequent reads carry the auth token.
+        self._catalog_client = None
+        return result
+
+    def logout(self) -> None:
+        """Log out of the tiled server and clear cached clients."""
+        if self._root_client is not None:
+            try:
+                self._root_client.logout()
+            finally:
+                self._root_client = None
+        self._catalog_client = None
+
+    def _get_catalog(self) -> Any:
+        if self._catalog_client is None:
+            # Walk the slash-separated catalog path from the root client so
+            # the same authenticated session is reused for both login and
+            # data access.
+            node = self._get_root_client()
+            for part in self.catalog.split("/"):
+                if not part:
+                    continue
+                node = node[part]
+            self._catalog_client = node
+        return self._catalog_client
+
+    def _get_run(self, uid: str) -> Any:
+        return self._get_catalog()[uid]
+
+    def peekAtMd(self, uid: str, detector: str = "saxs") -> dict[str, Any]:
+        """Return geometry metadata dict without loading images."""
+        run = self._get_run(uid)
+        if detector == "saxs":
+            geo = resolve_saxs_geometry(run, energy_kev=self.energy_kev)
+            return {
+                "energy_kev":         geo.energy_ev / 1000.0,
+                "dist_m":             geo.dist_m,
+                "beam_center_row_px": geo.beam_center_row_px,
+                "beam_center_col_px": geo.beam_center_col_px,
+                "active_beamstop":    geo.active_beamstop,
+            }
+        geo = resolve_waxs_geometry(run, energy_kev=self.energy_kev)
+        return {
+            "energy_kev":         geo.energy_ev / 1000.0,
+            "dist_m":             geo.dist_m,
+            "beam_center_row_px": geo.beam_center_row_px,
+            "beam_center_col_px": geo.beam_center_col_px,
+            "n_panels":           len(geo.panels),
+        }
+
+    def loadSingleImage(
+        self,
+        uid: str,
+        detector: str = "saxs",
+        geo_overrides: dict[str, Any] | None = None,
+        extra_attrs: dict[str, Any] | None = None,
+        image_cache_path: str | Path | None = None,
+    ) -> xr.DataArray | None:
+        """
+        Load raw images for one run.
+
+        Parameters
+        ----------
+        uid : str
+            Tiled run UID.
+        detector : {'saxs', 'waxs'}
+            Which detector to load.
+        geo_overrides : dict | None
+            Override specific geometry parameters.
+        extra_attrs : dict | None
+            Extra attrs to attach to the returned DataArray.
+        image_cache_path : str, Path, or None
+            If given, attempt to read images from this HDF5 cache file
+            before falling back to tiled.
+
+        Returns
+        -------
+        xr.DataArray or None
+            None if the requested detector is not present in the run.
+            SAXS: dims (pix_y, pix_x) or (frame, pix_y, pix_x)
+            WAXS: dims (waxs_arc, pix_y, pix_x)
+        """
+        run = self._get_run(uid)
+        overrides = dict(geo_overrides or {})
+
+        # Pre-populate baseline cache from HDF5 if available — avoids
+        # tiled round-trips in resolve_*_geometry and load_*_raw.
+        if image_cache_path is not None:
+            _prepopulate_caches_from_h5(run, image_cache_path)
+
+        if detector == "saxs":
+            if not _has_primary_field(run, SAXS_IMAGE_FIELD):
+                return None
+            geo = resolve_saxs_geometry(
+                run, energy_kev=self.energy_kev, **overrides
+            )
+            return load_saxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
+
+        if detector == "waxs":
+            if not _has_primary_field(run, WAXS_IMAGE_FIELD):
+                return None
+            geo = resolve_waxs_geometry(
+                run, energy_kev=self.energy_kev, **overrides
+            )
+            return load_waxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
+
+        raise ValueError(
+            f"Unknown detector '{detector}'. Expected 'saxs' or 'waxs'."
+        )
+
+    def loadRun(
+        self,
+        uid: str,
+        geo_overrides: dict[str, Any] | None = None,
+        extra_attrs: dict[str, Any] | None = None,
+    ) -> dict[str, xr.DataArray]:
+        """
+        Load both SAXS and WAXS raw images for one run.
+
+        Returns
+        -------
+        dict with keys ``'saxs'`` and ``'waxs'``, each an xr.DataArray.
+        """
+        return {
+            "saxs": self.loadSingleImage(
+                uid, "saxs", geo_overrides=geo_overrides, extra_attrs=extra_attrs,
+            ),
+            "waxs": self.loadSingleImage(
+                uid, "waxs", geo_overrides=geo_overrides, extra_attrs=extra_attrs,
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # Tiled catalog browsing convenience
+    # ------------------------------------------------------------------
+
+    def searchCatalog(
+        self,
+        sample: str | None = None,
+        plan: str | None = None,
+        scan_id: int | None = None,
+        cycle: str | None = None,
+        proposal: str | None = None,
+        user: str | None = None,
+        institution: str | None = None,
+        detector: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int | None = None,
+        outputType: str = "default",
+        **kwargs: Any,
+    ):
+        """Search the SMI Tiled catalog and return a results table.
+
+        Modeled on :meth:`SST1RSoXSDB.searchCatalog` so that browsers and
+        notebooks have a consistent API across NSLS-II beamlines.  Each
+        keyword argument is mapped to a databroker query against the
+        run-start metadata; only the keywords with a non-``None`` value
+        contribute to the search.
+
+        Parameters
+        ----------
+        sample, plan, user, institution, cycle : str | None
+            Case-insensitive substring (regex) matches against the
+            corresponding ``start`` keys.
+        scan_id, proposal : int | None
+            Exact numeric matches.
+        detector : {'saxs', 'waxs'} | None
+            If given, restrict to runs whose ``start.detectors`` field
+            contains the SMI image-field substring for that detector
+            (``"pil2M"`` or ``"pil900KW"``).
+        since, until : str | None
+            ISO-8601 timestamps, forwarded to
+            :meth:`tiled.client.Catalog.search` via the
+            ``TimeRange`` query.
+        limit : int | None
+            Cap the number of result rows returned (avoids pulling
+            thousands of metadata blobs over the network).
+        outputType : {'default', 'scans', 'all'}
+            ``'scans'`` returns a 1-column DataFrame of scan IDs;
+            ``'default'`` returns the columns
+            ``[scan_id, start_time, sample_name, plan_name, detectors,
+            num_points, uid]``; ``'all'`` adds ``cycle, user_name,
+            institution, proposal_id``.
+        **kwargs
+            Additional ``key=value`` pairs forwarded as
+            case-insensitive regex matches against ``start[key]``.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Empty DataFrame if no results.
+
+        Notes
+        -----
+        Requires ``tiled`` to be installed.  All network access is lazy:
+        the catalog is not contacted until this method is called.
+        """
+        import pandas as pd
+
+        cat = self._get_catalog()
+
+        try:
+            from tiled.queries import Key, Regex, TimeRange  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional dep
+            raise ImportError(
+                "searchCatalog requires `tiled.queries` (install `tiled[client]`)."
+            ) from exc
+
+        def _regex_search(node, field: str, value: str):
+            return node.search(Regex(field, f"(?i){value}"))
+
+        def _detector_substring(d: str) -> str:
+            d = d.lower()
+            if d == "saxs":
+                return "pil2M"
+            if d == "waxs":
+                return "pil900KW"
+            raise ValueError(f"detector must be 'saxs' or 'waxs', got {d!r}")
+
+        node = cat
+        if sample is not None:
+            node = _regex_search(node, "sample_name", str(sample))
+        if plan is not None:
+            node = _regex_search(node, "plan_name", str(plan))
+        if user is not None:
+            node = _regex_search(node, "user_name", str(user))
+        if institution is not None:
+            node = _regex_search(node, "institution", str(institution))
+        if cycle is not None:
+            node = _regex_search(node, "cycle", str(cycle))
+        if scan_id is not None:
+            node = node.search(Key("scan_id") == int(scan_id))
+        if proposal is not None:
+            node = node.search(Key("proposal_id") == int(proposal))
+        if detector is not None:
+            node = _regex_search(node, "detectors", _detector_substring(detector))
+        if since is not None or until is not None:
+            node = node.search(TimeRange(since=since, until=until))
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            if isinstance(value, (int, float)):
+                node = node.search(Key(key) == value)
+            else:
+                node = _regex_search(node, key, str(value))
+
+        rows: list[dict[str, Any]] = []
+        for i, (uid, run) in enumerate(node.items()):
+            if limit is not None and i >= int(limit):
+                break
+            try:
+                start = dict(run.metadata.get("start", {}))
+            except Exception:
+                start = {}
+            try:
+                stop = dict(run.metadata.get("stop", {}) or {})
+            except Exception:
+                stop = {}
+            num_points = None
+            try:
+                num_points = stop.get("num_events", {}).get("primary")
+            except Exception:
+                pass
+            row = {
+                "scan_id": start.get("scan_id"),
+                "start_time": start.get("time"),
+                "sample_name": start.get("sample_name"),
+                "plan_name": start.get("plan_name"),
+                "detectors": start.get("detectors"),
+                "num_points": num_points,
+                "uid": uid,
+            }
+            if outputType == "all":
+                row.update({
+                    "cycle": start.get("cycle"),
+                    "user_name": start.get("user_name"),
+                    "institution": start.get("institution"),
+                    "proposal_id": start.get("proposal_id"),
+                })
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        if outputType == "scans" and not df.empty:
+            df = df[["scan_id"]].copy()
+        return df
+
+    def browseCatalog(self, **kwargs: Any):
+        """Interactive catalog browser (uses :class:`ipyaggrid.Grid`).
+
+        Thin wrapper around :meth:`searchCatalog`; same kwargs.  Returns
+        an ``ipyaggrid.Grid`` widget suitable for Jupyter / JupyterHub.
+        """
+        df = self.searchCatalog(**kwargs)
+        try:
+            from ipyaggrid import Grid  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional dep
+            raise ImportError(
+                "browseCatalog requires `ipyaggrid` (pip install ipyaggrid)."
+            ) from exc
+        return Grid(
+            grid_data=df,
+            grid_options={
+                "columnDefs": [{"field": c} for c in df.columns],
+                "enableSorting": True,
+                "enableFilter": True,
+                "enableColResize": True,
+            },
+        )
+
+    def summarizeRun(self, uid: str) -> dict[str, Any]:
+        """Return a small dict of headline metadata for one uid.
+
+        Useful for "what is this scan?" lookups in browser tooltips
+        without paying for a full primary-stream read.
+        """
+        run = self._get_run(uid)
+        try:
+            start = dict(run.metadata.get("start", {}))
+        except Exception:
+            start = {}
+        detectors = start.get("detectors") or []
+        detector_kinds: list[str] = []
+        from smi_tiled.defaults import classify_detector_field
+        for d in detectors:
+            kind = classify_detector_field(d)
+            if kind and kind not in detector_kinds:
+                detector_kinds.append(kind)
+        return {
+            "uid": uid,
+            "scan_id": start.get("scan_id"),
+            "sample_name": start.get("sample_name"),
+            "plan_name": start.get("plan_name"),
+            "detectors": detectors,
+            "detector_kinds": detector_kinds,
+            "start_time": start.get("time"),
+            "num_points": start.get("num_points"),
+        }

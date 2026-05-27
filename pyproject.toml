@@ -1,0 +1,119 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smi-tiled"
+dynamic = ["version"]
+description = "Tiled-native loader, integrator, and uploader for NSLS-II SMI WAXS+SAXS (beamline 12-ID)."
+readme = "README.md"
+license = "NIST-PD-fallback"
+authors = [
+    {name = "SMI Beamline / NSLS-II"},
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "xarray",
+    "pandas",
+    "scikit-image",
+    "h5py",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+tiled = [
+    "tiled[client]>=0.1.0a74",
+    "bluesky-tiled-plugins",
+]
+# `upload` layers on `tiled`; pip users should install with
+# `pip install smi-tiled[tiled,upload]` to get both together.
+upload = [
+    "httpx",
+    "zarr",
+]
+dev = [
+    "pytest",
+    "coverage",
+    "flake8",
+]
+docs = [
+    "sphinx",
+    "pydata-sphinx-theme",
+]
+all = [
+    "smi-tiled[tiled,upload,dev,docs]",
+]
+
+[project.scripts]
+smi-upload = "smi_tiled.upload.cli:main"
+smi-calibrate-z = "smi_tiled.calibration.cli:main_z_scan"
+
+[project.urls]
+Homepage = "https://github.com/EliotGann/smi-tiled"
+Issues = "https://github.com/EliotGann/smi-tiled/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+smi_tiled = ["data/*.json", "data/masks/*.json"]
+
+[tool.setuptools_scm]
+write_to = "src/smi_tiled/_version.py"
+
+# ---------------------------------------------------------------------------
+# Pixi: conda-first environment + task runner
+# ---------------------------------------------------------------------------
+
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64"]
+
+[tool.pixi.dependencies]
+python = ">=3.10,<3.14"
+numpy = "*"
+scipy = "*"
+xarray = "*"
+pandas = "*"
+scikit-image = "*"
+h5py = "*"
+tqdm = "*"
+
+# Pixi installs the package itself in editable mode and pulls the
+# PEP-621 optional-dependency groups (tiled, upload, dev, docs) declared
+# above.  This avoids declaring the same PyPI deps twice (once in
+# [project.optional-dependencies] and once under [tool.pixi.*]).
+[tool.pixi.pypi-dependencies]
+smi-tiled = { path = ".", editable = true, extras = ["tiled", "upload", "dev"] }
+
+[tool.pixi.feature.docs.pypi-dependencies]
+smi-tiled = { path = ".", editable = true, extras = ["docs"] }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+docs    = { features = ["docs"], solve-group = "docs" }
+
+[tool.pixi.tasks]
+test       = "pytest -v tests/"
+test-quick = "pytest -q tests/ --tb=line"
+lint       = "flake8 src/ tests/ --max-line-length=127 --max-complexity=12"
+lint-fatal = "flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics"
+coverage   = "coverage run -m pytest tests/ && coverage report"
+calibrate-z = "python scripts/calibrate_smi_z_scan.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

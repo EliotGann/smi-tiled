@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+src/smi_tiled/_version.py
+
+# Pixi
+.pixi/
+pixi.lock
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local calibration outputs (committed assets live under src/smi_tiled/data/)
+/tmp/agb_z_calibration_results.npz
+/tmp/saxs_calibration.json
+/tmp/smi_beamstop_offsets.json
