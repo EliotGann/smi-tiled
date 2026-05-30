@@ -57,6 +57,71 @@ class TestResolveMaskSpec:
 
 
 # ---------------------------------------------------------------------------
+# SAXS: bare-polygon beamstop entries (load_mask_polygons / hand-edited form)
+# ---------------------------------------------------------------------------
+
+class TestSAXSBarePolygonBeamstop:
+    """A beamstop may map directly to a bare ``[[col, row], ...]`` polygon
+    (the normalized form emitted by ``defaults.load_mask_polygons`` and used
+    by hand-edited mask files) instead of a ``{...}`` dict.  This must build a
+    mask, not raise ``AttributeError: 'list' object has no attribute 'get'``."""
+
+    def test_single_bare_polygon_beamstop(self):
+        shape = (60, 60)
+        spec = {
+            "image_shape": list(shape),
+            "static_regions": {},
+            "beamstops": {
+                "pin": [[10, 10], [20, 10], [20, 20], [10, 20]],
+            },
+        }
+        m = make_saxs_mask_from_dict(
+            image_shape=shape, mask_spec=spec, active_beamstop="pin",
+        )
+        m = np.asarray(m)
+        # Interior of the bare polygon is masked (False = invalid); a point
+        # well outside it stays valid.
+        assert not bool(m[15, 15])
+        assert bool(m[2, 2])
+
+    def test_list_of_bare_polygons_beamstop(self):
+        shape = (60, 60)
+        spec = {
+            "image_shape": list(shape),
+            "static_regions": {},
+            "beamstops": {
+                "pin": [
+                    [[10, 10], [20, 10], [20, 20], [10, 20]],
+                    [[40, 40], [50, 40], [50, 50], [40, 50]],
+                ],
+            },
+        }
+        m = np.asarray(make_saxs_mask_from_dict(
+            image_shape=shape, mask_spec=spec, active_beamstop="pin",
+        ))
+        assert not bool(m[15, 15])
+        assert not bool(m[45, 45])
+        assert bool(m[30, 5])
+
+    def test_bare_polygon_path_and_dict_agree(self, tmp_path):
+        shape = (60, 60)
+        spec = {
+            "image_shape": list(shape),
+            "static_regions": {"g": [[0, 0], [5, 0], [5, 5], [0, 5]]},
+            "beamstops": {"pin": [[10, 10], [20, 10], [20, 20], [10, 20]]},
+        }
+        p = tmp_path / "bare.json"
+        p.write_text(json.dumps(spec))
+        m_path = make_saxs_mask_from_spec(
+            image_shape=shape, mask_path=str(p), active_beamstop="pin",
+        )
+        m_dict = make_saxs_mask_from_dict(
+            image_shape=shape, mask_spec=spec, active_beamstop="pin",
+        )
+        np.testing.assert_array_equal(np.asarray(m_path), np.asarray(m_dict))
+
+
+# ---------------------------------------------------------------------------
 # SAXS: dict vs path equivalence (bundled default)
 # ---------------------------------------------------------------------------
 

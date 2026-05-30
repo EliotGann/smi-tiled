@@ -638,7 +638,8 @@ def make_saxs_mask_from_dict(
             },
         }
 
-    Beamstop polygons may be specified in two ways:
+    A beamstop entry may be a ``dict`` (specified in one of two ways) or a
+    bare polygon:
 
     * ``polygon_offsets_from_beam`` — list of ``[d_col, d_row]`` offsets
       relative to the resolved beam center.  This is the preferred form
@@ -650,6 +651,13 @@ def make_saxs_mask_from_dict(
       then shifted by ``(cur_motor - reference_mm) * pixels_per_mm`` if
       *beamstop_pos_mm* is provided.  Retained for backwards compatibility
       with mask files written before beam-center anchoring was supported.
+
+    * **bare polygon** — the beamstop maps directly to a ``[[col, row], ...]``
+      polygon (or a list of such polygons) in absolute detector coordinates,
+      with no enclosing dict.  This is the normalized form emitted by
+      :func:`smi_tiled.defaults.load_mask_polygons` and produced by hand-edited
+      / exported mask files.  Used as-is (no beam-center anchoring or motor
+      shift).
 
     Parameters
     ----------
@@ -676,6 +684,27 @@ def make_saxs_mask_from_dict(
     polys = list(static_regions.values())
 
     bs = beamstops_spec.get(active_beamstop, {})
+
+    if isinstance(bs, (list, tuple)):
+        # Bare polygon(s) in absolute detector pixel coords — the normalized
+        # form emitted by :func:`smi_tiled.defaults.load_mask_polygons` and used
+        # by hand-edited / exported mask files, where a beamstop maps directly
+        # to a ``[[col, row], ...]`` polygon (or a list of such polygons) rather
+        # than to a ``{"polygon_offsets_from_beam": ...}`` dict.  Appended as-is:
+        # the coordinates are already absolute, so no beam-center anchoring or
+        # motor shift is applied.
+        if bs:
+            first = bs[0]
+            is_list_of_polys = (
+                isinstance(first, (list, tuple))
+                and len(first) > 0
+                and isinstance(first[0], (list, tuple))
+            )
+            bare_polys = bs if is_list_of_polys else [bs]
+            for poly in bare_polys:
+                if poly:
+                    polys.append([[float(c), float(r)] for c, r in poly])
+        return polygons_to_mask(image_shape, polys)
 
     bs_offsets = bs.get("polygon_offsets_from_beam")
     if bs_offsets is not None:
