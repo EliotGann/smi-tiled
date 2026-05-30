@@ -72,8 +72,8 @@ Recognized keys:
 | `_SAXS_MOTOR_Y_REF_MM` | `2.45` | `float`, mm |
 | `_SAXS_MOTOR_Z_REF_MM` | `0.0` | `float`, mm |
 | `_SAXS_PIEZO_Z_REF_UM` | `0.0` | `float`, μm |
-| `_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM` | `5.8211` | `float`, px/mm |
-| `_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM` | `5.9963` | `float`, px/mm |
+| `_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM` | `0.0` | `float`, px/mm (PV already tracks motor_x) |
+| `_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM` | `0.0` | `float`, px/mm (PV already tracks motor_y) |
 | `_SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM` | `0.0` | `float`, px/mm |
 | `_SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM` | `0.0` | `float`, px/mm |
 | `_SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM` | `0.000988` | `float`, mm/μm |
@@ -101,6 +101,15 @@ dist_mm  += (piezo_z_um - _SAXS_PIEZO_Z_REF_UM) * _SAXS_SDD_DELTA_MM_PER_PIEZO_Z
 dist_mm  += _SAXS_DEFAULT_DISTANCE_DELTA_MM
 beam_row += _SAXS_DEFAULT_BEAM_DELTA_ROW_PX
 beam_col += _SAXS_DEFAULT_BEAM_DELTA_COL_PX
+```
+
+```{note}
+The `motor_x`/`motor_y` beam-center slopes default to `0.0`, so the two
+motor_x/y lines above are no-ops by default: the resolved beam center equals the
+live EPICS PV, which already tracks the detector translation. They are kept 0.0
+to avoid double-counting (a non-zero slope pushed the center ~120 px off on AGB
+scans). Do not restore the historical `5.82`/`5.99` values unless a future
+detector reports a *static* beam-center PV.
 ```
 
 ## When to regenerate

@@ -81,22 +81,28 @@ _SAXS_DEFAULT_BEAM_DELTA_ROW_PX =  0.0        # additive correction to metadata 
 _SAXS_DEFAULT_BEAM_DELTA_COL_PX =  0.0        # additive correction to metadata col
 
 # SAXS motor-driven geometry corrections.
-# The baseline EPICS PVs (pil2M_beam_center_x_px, pil2M_beam_center_y_px) are
-# static calibration values, set once at a known motor configuration.  When
-# the detector translates (pil2M_motor_x/y) or the sample moves along the beam
-# (piezo_z), the physical beam position on the detector and the effective
-# sample-detector distance both shift.  These constants encode the linear
-# mapping; values are overrideable per-call.  Calibrated from the AGB grid
-# scan b0f165c4-203e-4d58-af17-916620b974c2 (regression residuals ≤1 px).
-_SAXS_MOTOR_X_REF_MM: float = 1.88             # baseline EPICS bc_col matches actual at this motor_x
-_SAXS_MOTOR_Y_REF_MM: float = 2.45             # baseline EPICS bc_row matches actual at this motor_y
+# IMPORTANT: the EPICS PVs (pil2M_beam_center_x_px, pil2M_beam_center_y_px) are
+# NOT static — they already track the detector translation motors.  Measured
+# across scans the PV moves with motor_y at ~6 px/mm (e.g. ~1107 px at
+# motor_y=0, ~1003.5 px at motor_y=-18.5 mm), i.e. it already encodes the
+# detector x/y position.  Applying an additional (motor - ref) * slope
+# correction on top therefore DOUBLE-COUNTS and pushes the beam center ~120 px
+# off (confirmed against AgBh ring fits on EG_AGB scans).  Hence the motor_x/y
+# px-per-mm slopes default to 0.0: by default the resolved beam center equals
+# the live metadata PV.  Set these non-zero ONLY for a future detector whose
+# beam-center PV is a static, position-independent calibration value.  Values
+# remain overrideable per-call (beam_col_px_per_motor_x_mm, ...).
+_SAXS_MOTOR_X_REF_MM: float = 1.88             # reference motor_x (unused while slope=0; kept for the override API)
+_SAXS_MOTOR_Y_REF_MM: float = 2.45             # reference motor_y (unused while slope=0; kept for the override API)
 _SAXS_MOTOR_Z_REF_MM: float = 0.0              # motor_z reference (BC drift relative to here)
 _SAXS_PIEZO_Z_REF_UM: float = 0.0              # piezo_z reference (offset absorbed in DISTANCE_DELTA)
-# px/mm slopes from regression: motor_x→bc_col slope = 5.821 = 1/0.172 exactly.
-# motor_y→bc_row slope ≈ 5.996 (slightly steeper than nominal; possibly the
-# stage is not perfectly perpendicular).
-_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM: float = +5.8211
-_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM: float = +5.9963
+# motor_x/y -> beam-center slopes.  Default 0.0 because the EPICS beam-center
+# PVs already track motor_x/y (see note above); a non-zero slope here would
+# double-count.  (The historical regression on AGB grid scan b0f165c4 found
+# ~5.82/5.99 px/mm — that is the rate at which the PV *itself* moves, not an
+# extra correction to add.)
+_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM: float = 0.0
+_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM: float = 0.0
 # motor_z → BC drift: if the beam is perfectly along the motor_z axis,
 # these are zero.  Non-zero values indicate small misalignment of the
 # beam axis vs the motor_z translation axis, derived from an AGB

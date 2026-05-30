@@ -7,11 +7,11 @@ module-level defaults in `smi_tiled.loader`:
 | Constant | Default | Role |
 |---|---|---|
 | `_SAXS_DEFAULT_DISTANCE_DELTA_MM` | from calibration JSON | Additive correction: `SDD = motor_z + delta` |
-| `_SAXS_MOTOR_X_REF_MM`, `_SAXS_MOTOR_Y_REF_MM` | `1.88`, `2.45` | Reference motor positions where EPICS beam center is correct |
+| `_SAXS_MOTOR_X_REF_MM`, `_SAXS_MOTOR_Y_REF_MM` | `1.88`, `2.45` | Reference motor positions (unused while the x/y slopes are 0.0; kept for the override API) |
 | `_SAXS_MOTOR_Z_REF_MM` | `0.0` | Reference motor_z for the small motor_z→BC drift |
 | `_SAXS_PIEZO_Z_REF_UM` | `0.0` | Reference piezo_z for the piezo_z→SDD effect |
-| `_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM` | `5.8211` | px / mm slope, motor_x → beam column |
-| `_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM` | `5.9963` | px / mm slope, motor_y → beam row |
+| `_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM` | `0.0` | px / mm slope, motor_x → beam column. **0.0**: the EPICS PV already tracks motor_x (non-zero double-counts) |
+| `_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM` | `0.0` | px / mm slope, motor_y → beam row. **0.0**: the EPICS PV already tracks motor_y (non-zero double-counts) |
 | `_SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM` | from calibration JSON | px / mm slope, motor_z → beam column |
 | `_SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM` | from calibration JSON | px / mm slope, motor_z → beam row |
 | `_SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM` | from calibration JSON | mm / μm slope, piezo_z → SDD |
