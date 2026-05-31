@@ -2702,6 +2702,81 @@ def _resolve_build_detector_ds(
     return False
 
 
+def _dir_is_writable(path: Path) -> bool:
+    """Create *path* if needed and confirm we can write a file inside it."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".smi_write_test"
+        probe.touch()
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_frame_store_dir(
+    uid: str,
+    frame_qchi_store: "str | Path | None",
+    image_cache_path: "str | Path | None",
+    n_frames: int,
+) -> "Path | None":
+    """Resolve a *writable* directory for the streamed per-frame q-chi store.
+
+    Returns ``None`` to mean "keep per-frame q-chi in memory".
+
+    ``"auto"`` streams only for large scans, preferring the directory of the
+    provided image cache (known writable in the SMI browser flow), then the
+    standard cache dir, then a private temp dir.  Each candidate is probed for
+    writability — ``_cache_dir()`` uses ``mkdir(exist_ok=True)`` and so happily
+    returns a shared dir owned by another user, which then fails only when we
+    try to create a sub-store.  An explicit path is honoured with the same
+    fallback.  Only if nothing is writable do we fall back to in-memory.
+    """
+    import tempfile
+
+    if frame_qchi_store is None:
+        return None
+
+    candidates: list[Path] = []
+    if frame_qchi_store == "auto":
+        if n_frames <= _DETECTOR_DS_AUTO_MAX_FRAMES:
+            return None
+        if isinstance(image_cache_path, (str, Path)):
+            try:
+                candidates.append(
+                    Path(image_cache_path).expanduser().parent / f"{uid}_qchi"
+                )
+            except Exception:
+                pass
+        try:
+            from smi_tiled.loader import _cache_dir
+            candidates.append(_cache_dir() / f"{uid}_qchi")
+        except Exception:
+            pass
+    else:
+        candidates.append(Path(frame_qchi_store))
+
+    for cand in candidates:
+        if _dir_is_writable(cand):
+            return cand
+
+    try:
+        tmp = Path(tempfile.mkdtemp(prefix=f"smi_qchi_{uid}_"))
+        warnings.warn(
+            f"frame_qchi_store: preferred cache locations were not writable; "
+            f"streaming per-frame q-chi to temp dir {tmp} instead.",
+            stacklevel=3,
+        )
+        return tmp
+    except OSError:
+        warnings.warn(
+            "frame_qchi_store: no writable location found; keeping per-frame "
+            "q-chi in memory (may use significant RAM on large scans).",
+            stacklevel=3,
+        )
+        return None
+
+
 def integrate_saxs(
     saxs_raw: xr.DataArray,
     mask: np.ndarray | None,
@@ -3407,7 +3482,6 @@ def reduce_smi_combined(
     from smi_tiled.loader import (
         TiledSMISWAXSLoader,
         _auto_cache_path,
-        _cache_dir,
         clear_baseline_cache,
         infer_detectors_and_steps,
         populate_cache,
@@ -3471,15 +3545,9 @@ def reduce_smi_combined(
             n = max(n, waxs_raw.shape[0] if waxs_raw.ndim > 2 else 1)
         return n
 
-    if frame_qchi_store is None:
-        _store_dir = None
-    elif frame_qchi_store == "auto":
-        _store_dir = (
-            _cache_dir() / f"{uid}_qchi"
-            if _frame_counts() > _DETECTOR_DS_AUTO_MAX_FRAMES else None
-        )
-    else:
-        _store_dir = Path(frame_qchi_store)
+    _store_dir = _resolve_frame_store_dir(
+        uid, frame_qchi_store, image_cache_path, _frame_counts()
+    )
     saxs_qchi_store = str(_store_dir / "saxs_qchi.zarr") if _store_dir is not None else None
     waxs_qchi_store = str(_store_dir / "waxs_qchi.zarr") if _store_dir is not None else None
 
