@@ -1359,6 +1359,127 @@ def _histogram2d_pixel_split(
     return I_hist, N_hist
 
 
+def _bin_indices(vals: np.ndarray, edges: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Reproduce ``np.histogram``'s bin assignment for explicit edges.
+
+    For an array of edges, ``np.histogramdd`` computes
+    ``searchsorted(edges, x, side='right')`` and decrements the entries that
+    sit exactly on the rightmost edge (so the last bin is closed).  Values
+    outside ``[edges[0], edges[-1]]`` — and NaNs, which sort to the end — are
+    flagged invalid.  Reproducing that logic lets us precompute the bin index
+    of every pixel **once** and reuse it across all frames (the geometry, and
+    therefore the q/chi maps and bin edges, are identical for every frame).
+
+    Returns
+    -------
+    bin_idx : int64 array
+        Zero-based bin index (meaningful only where ``in_range``).
+    in_range : bool array
+        True where the value falls inside the histogram range.
+    """
+    nb = len(edges) - 1
+    idx = np.searchsorted(edges, vals, side="right")
+    idx[vals == edges[-1]] -= 1
+    in_range = (idx >= 1) & (idx <= nb)
+    return idx - 1, in_range
+
+
+class _SplitBinPlan:
+    """Precomputed pixel->(q,chi) bin mapping for fast repeated integration.
+
+    ``_histogram2d_pixel_split`` recomputes, for every frame, which (q, chi)
+    bin each pixel falls into — an expensive ``searchsorted`` over millions of
+    pixels.  But for a stack of frames sharing one geometry the mapping never
+    changes; only the per-pixel intensities and the per-frame validity mask do.
+
+    This class precomputes, for each sub-pixel offset, a sparse
+    ``(n_bins, n_pixels)`` matrix ``M`` whose row is the flattened output bin
+    and whose column is the source pixel.  Integrating a frame is then a sparse
+    mat-vec: ``I = M @ (img * valid)`` and ``N = M @ valid`` — folding the
+    per-frame mask into the input vector.  Results are numerically equivalent
+    to :func:`_histogram2d_pixel_split` (to within float summation order).
+
+    The construction mirrors the gradient-based sub-pixel splitting of
+    :func:`_histogram2d_pixel_split` exactly so outputs match for any
+    ``pixel_splitting``.
+    """
+
+    def __init__(
+        self,
+        q2d: np.ndarray,
+        chi2d: np.ndarray,
+        q_edges: np.ndarray,
+        chi_edges: np.ndarray,
+        pixel_splitting: int = 1,
+    ) -> None:
+        from scipy import sparse
+
+        self.n_q = len(q_edges) - 1
+        self.n_chi = len(chi_edges) - 1
+        self.n_bins = self.n_q * self.n_chi
+        self.n_pixels = q2d.size
+        self.shape = q2d.shape
+
+        n = max(int(pixel_splitting), 1)
+        self.weight = 1.0 / (n * n)
+
+        if n == 1:
+            sub_positions = [(q2d, chi2d)]
+        else:
+            dq_dr = np.gradient(q2d, axis=0)
+            dq_dc = np.gradient(q2d, axis=1)
+            dchi_dr = np.gradient(chi2d, axis=0)
+            dchi_dc = np.gradient(chi2d, axis=1)
+            offsets = np.linspace(-0.5 + 0.5 / n, 0.5 - 0.5 / n, n)
+            sub_positions = []
+            for dr in offsets:
+                for dc in offsets:
+                    q_sub = q2d + dr * dq_dr + dc * dq_dc
+                    chi_sub = chi2d + dr * dchi_dr + dc * dchi_dc
+                    sub_positions.append((q_sub, chi_sub))
+
+        self._mats: list[Any] = []
+        pix_idx = np.arange(self.n_pixels, dtype=np.int64)
+        for q_sub, chi_sub in sub_positions:
+            qb, q_ok = _bin_indices(q_sub.ravel(), q_edges)
+            cb, c_ok = _bin_indices(chi_sub.ravel(), chi_edges)
+            ok = q_ok & c_ok & np.isfinite(q_sub.ravel()) & np.isfinite(chi_sub.ravel())
+            rows = (qb[ok] * self.n_chi + cb[ok]).astype(np.int64)
+            cols = pix_idx[ok]
+            data = np.ones(rows.size, dtype=np.float64)
+            self._mats.append(
+                sparse.csr_matrix(
+                    (data, (rows, cols)), shape=(self.n_bins, self.n_pixels)
+                )
+            )
+
+    def integrate_frame(
+        self, img: np.ndarray, valid: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Integrate one frame. ``img``/``valid`` are 2-D, same shape as geometry.
+
+        ``valid`` is the boolean per-frame mask (mask AND finite-image AND any
+        dezinger flags).  Invalid pixels are zeroed in the weight vector so
+        NaNs never reach the histogram.
+        """
+        valid_f = valid.ravel().astype(np.float64)
+        wI = np.where(valid.ravel(), img.ravel().astype(np.float64), 0.0)
+        I_hist = np.zeros(self.n_bins, dtype=np.float64)
+        N_hist = np.zeros(self.n_bins, dtype=np.float64)
+        for M in self._mats:
+            I_hist += M.dot(wI)
+            N_hist += M.dot(valid_f)
+        # ``self.weight`` == 1.0 for pixel_splitting == 1 (single sub-pixel),
+        # matching the original unweighted single-point histogram; for >1 it is
+        # 1/(n*n), distributing each pixel's intensity/count across sub-pixels.
+        I_hist *= self.weight
+        N_hist *= self.weight
+        return (
+            I_hist.reshape(self.n_q, self.n_chi),
+            N_hist.reshape(self.n_q, self.n_chi),
+        )
+
+
 def _qchi_and_iq(
     accum_I: np.ndarray,
     accum_N: np.ndarray,
@@ -1427,6 +1548,53 @@ def _stack_iq_frames(frame_iq: list[xr.Dataset]) -> xr.Dataset:
             "q": np.asarray(first["q"].values, dtype=float),
         },
     )
+
+
+class _ZarrFrameWriter:
+    """Stream per-frame ``(q, chi)`` maps to a zarr store on disk.
+
+    For large parallel scans the full ``(frame, q, chi)`` stack is tens of GB
+    and must not be held in RAM.  This writer creates the on-disk array layout
+    up front (via an xarray template written with ``compute=False``, which
+    writes coordinates + metadata but no bulk data), then fills one frame at a
+    time with a direct zarr slice write — so peak memory is a single frame
+    regardless of frame count.
+
+    :meth:`dataset` returns the store opened with :func:`xarray.open_zarr`, i.e.
+    a **lazy, dask-backed** ``xr.Dataset`` chunked one-frame-per-chunk.
+    Consumers index/compute frames on demand without loading the whole stack.
+    """
+
+    def __init__(self, path, n_frames: int, q_grid: np.ndarray, chi_grid: np.ndarray):
+        import dask.array as da
+        import zarr
+
+        self.path = str(path)
+        nq, nchi = len(q_grid), len(chi_grid)
+        chunks = (1, nq, nchi)
+        template = xr.Dataset(
+            {
+                "intensity": (("frame", "q", "chi"),
+                              da.zeros((n_frames, nq, nchi), chunks=chunks, dtype=float)),
+                "counts": (("frame", "q", "chi"),
+                           da.zeros((n_frames, nq, nchi), chunks=chunks, dtype=float)),
+            },
+            coords={
+                "frame": np.arange(n_frames, dtype=int),
+                "q": np.asarray(q_grid, dtype=float),
+                "chi": np.asarray(chi_grid, dtype=float),
+            },
+        )
+        # Writes coords + array metadata now; defers (skips) the lazy zeros.
+        template.to_zarr(self.path, mode="w", compute=False)
+        self._z = zarr.open(self.path, mode="r+")
+
+    def write(self, idx: int, intensity_2d: np.ndarray, counts_2d: np.ndarray) -> None:
+        self._z["intensity"][idx] = np.asarray(intensity_2d, dtype=float)
+        self._z["counts"][idx] = np.asarray(counts_2d, dtype=float)
+
+    def dataset(self) -> xr.Dataset:
+        return xr.open_zarr(self.path)
 
 
 # ===================================================================
@@ -2505,6 +2673,35 @@ def reduce_smi_gi(
 # SAXS integration
 # ===================================================================
 
+#: Above this frame count, the per-frame detector-space ``ds`` output is
+#: skipped by default.  ``ds`` carries a full float64 copy of the image stack
+#: plus per-frame geometry/mask arrays — tens of GB on large parallel scans —
+#: and is never consumed by the reduction itself (merged products and per-frame
+#: I(q) do not depend on it).  Pass ``build_detector_ds=True`` to force it.
+_DETECTOR_DS_AUTO_MAX_FRAMES = 50
+
+
+def _resolve_build_detector_ds(
+    build_detector_ds: bool | None, n_frames: int, detector: str
+) -> bool:
+    """Resolve the tri-state ``build_detector_ds`` flag.
+
+    ``None`` (default) means *auto*: build the detector-space ``ds`` only for
+    small scans, skip it (with a warning) for large ones so they don't OOM.
+    """
+    if build_detector_ds is not None:
+        return bool(build_detector_ds)
+    if n_frames <= _DETECTOR_DS_AUTO_MAX_FRAMES:
+        return True
+    warnings.warn(
+        f"[integrate_{detector}] skipping the detector-space 'ds' output for "
+        f"{n_frames} frames (> {_DETECTOR_DS_AUTO_MAX_FRAMES}) to bound memory; "
+        f"pass build_detector_ds=True to force it.",
+        stacklevel=3,
+    )
+    return False
+
+
 def integrate_saxs(
     saxs_raw: xr.DataArray,
     mask: np.ndarray | None,
@@ -2520,8 +2717,17 @@ def integrate_saxs(
     dezinger_kernel: int = 5,
     cache_geometry: bool = True,
     pixel_splitting: int = 1,
+    build_detector_ds: bool | None = None,
+    build_frame_qchi: bool = True,
+    frame_qchi_store: "str | Path | None" = None,
 ) -> dict[str, Any]:
-    """SAXS reduction via direct pixel-space q-map and histogram binning."""
+    """SAXS reduction via direct pixel-space q-map and histogram binning.
+
+    When *frame_qchi_store* is given, the per-frame ``(q, chi)`` maps are
+    streamed to that zarr path one frame at a time and ``out['q_chi_frames']``
+    is returned as a lazy, dask-backed dataset (see :class:`_ZarrFrameWriter`),
+    so peak memory stays at a single frame regardless of frame count.
+    """
     _t0_saxs = _time.perf_counter()
     attrs = saxs_raw.attrs
     # Build geometry arrays from attrs
@@ -2619,7 +2825,10 @@ def integrate_saxs(
     print(f"  [integrate_saxs] mask+large_area: "
           f"{_time.perf_counter() - _t_mask:.3f}s")
 
-    # Per-frame dezinger: flag hot pixels
+    # Dezinger: flag hot pixels.  Kept as a per-frame loop on purpose — the
+    # cost is C-level uniform-filter time, not Python overhead, and a whole-
+    # stack vectorization would allocate a second copy of the (already large)
+    # image stack (~16 GB at 800 frames), defeating the point on big scans.
     _t_dez = _time.perf_counter()
     if dezinger_threshold is not None:
         for _di in range(n_frames):
@@ -2662,6 +2871,21 @@ def integrate_saxs(
     frame_qchi: list[xr.Dataset] = []
     frame_iq: list[xr.Dataset] = []
 
+    # Precompute the pixel->bin mapping ONCE.  The q/chi maps and bin edges are
+    # identical for every frame, so we never need to recompute which bin each
+    # pixel falls into — only the per-frame intensities and validity mask vary.
+    # ``_SplitBinPlan`` turns per-frame integration into a sparse mat-vec.
+    _t_plan = _time.perf_counter()
+    plan = _SplitBinPlan(q2d, chi_deg_2d, q_edges, chi_edges,
+                         pixel_splitting=pixel_splitting)
+    print(f"  [integrate_saxs] bin-plan precompute: "
+          f"{_time.perf_counter() - _t_plan:.3f}s")
+
+    qchi_writer = (
+        _ZarrFrameWriter(frame_qchi_store, n_frames, q_grid, chi_grid)
+        if frame_qchi_store is not None else None
+    )
+
     _t_loop = _time.perf_counter()
     _t_hist_total = 0.0
     _t_qchi_total = 0.0
@@ -2673,20 +2897,18 @@ def integrate_saxs(
                 img = np.where(sa_valid, img / sa, np.nan)
 
         valid = per_frame_valid[idx] & np.isfinite(img)
-        i_hist = np.zeros((n_q, n_chi), dtype=float)
-        n_hist = np.zeros((n_q, n_chi), dtype=float)
         _th = _time.perf_counter()
-        if np.any(valid):
-            i_hist, n_hist = _histogram2d_pixel_split(
-                q2d, chi_deg_2d, img, valid, q_edges, chi_edges,
-                pixel_splitting=pixel_splitting,
-            )
+        i_hist, n_hist = plan.integrate_frame(img, valid)
         _t_hist_total += _time.perf_counter() - _th
         accum_I += i_hist
         accum_N += n_hist
         _tq = _time.perf_counter()
         frame_out = _qchi_and_iq(i_hist, n_hist, q_grid, chi_grid)
-        frame_qchi.append(frame_out["q_chi"])
+        if qchi_writer is not None:
+            qchi_writer.write(idx, frame_out["q_chi"]["intensity"].values,
+                              frame_out["q_chi"]["counts"].values)
+        elif build_frame_qchi:
+            frame_qchi.append(frame_out["q_chi"])
         frame_iq.append(frame_out["iq"])
         _t_qchi_total += _time.perf_counter() - _tq
 
@@ -2695,43 +2917,49 @@ def integrate_saxs(
           f"(hist={_t_hist_total:.3f}s, qchi={_t_qchi_total:.3f}s)")
     _t_build = _time.perf_counter()
     out = _qchi_and_iq(accum_I, accum_N, q_grid, chi_grid)
-    out["q_chi_frames"] = _stack_qchi_frames(frame_qchi)
+    if qchi_writer is not None:
+        out["q_chi_frames"] = qchi_writer.dataset()
+    elif build_frame_qchi:
+        out["q_chi_frames"] = _stack_qchi_frames(frame_qchi)
+    else:
+        out["q_chi_frames"] = None
     out["iq_frames"] = _stack_iq_frames(frame_iq)
 
-    # Build detector-space xr.Dataset
-    ds_images = images.astype(float)
-    ds_q2d = q2d
-    ds_qh2d = qh2d
-    ds_qv2d = qv2d
-    ds_masks = per_frame_valid
+    # Build detector-space xr.Dataset (optional — large and never consumed by
+    # the reduction itself; skipped automatically for big scans).
+    make_ds = _resolve_build_detector_ds(build_detector_ds, n_frames, "saxs")
+    if make_ds:
+        ds_images = images.astype(float)
+        ds_q2d = q2d
+        ds_qh2d = qh2d
+        ds_qv2d = qv2d
+        ds_masks = per_frame_valid
 
-    if rotate_cw_90:
-        ds_images = np.rot90(ds_images, k=-1, axes=(-2, -1))
-        ds_q2d = np.rot90(ds_q2d, k=-1)
-        ds_qh2d = np.rot90(ds_qh2d, k=-1)
-        ds_qv2d = np.rot90(ds_qv2d, k=-1)
-        ds_masks = np.rot90(ds_masks, k=-1, axes=(-2, -1))
+        if rotate_cw_90:
+            ds_images = np.rot90(ds_images, k=-1, axes=(-2, -1))
+            ds_q2d = np.rot90(ds_q2d, k=-1)
+            ds_qh2d = np.rot90(ds_qh2d, k=-1)
+            ds_qv2d = np.rot90(ds_qv2d, k=-1)
+            ds_masks = np.rot90(ds_masks, k=-1, axes=(-2, -1))
 
-    ds = xr.Dataset(
-        {
-            "intensity": (("frame", "row", "col"), ds_images),
-            "q_abs": (
-                ("frame", "row", "col"),
-                np.repeat(ds_q2d[np.newaxis], n_frames, axis=0),
-            ),
-            "q_horizontal": (
-                ("frame", "row", "col"),
-                np.repeat(ds_qh2d[np.newaxis], n_frames, axis=0),
-            ),
-            "q_vertical": (
-                ("frame", "row", "col"),
-                np.repeat(ds_qv2d[np.newaxis], n_frames, axis=0),
-            ),
-            "mask": (("frame", "row", "col"), ds_masks),
-        },
-        coords={"frame": np.arange(n_frames, dtype=int)},
-    )
-    out["ds"] = ds
+        # The SAXS q-maps are identical for every frame (fixed transmission
+        # geometry), so store them ONCE as 2-D (row, col) instead of repeating
+        # them n_frames times.  At 800 frames the old np.repeat layout allocated
+        # tens of GB of redundant geometry; this keeps only the per-frame
+        # intensity/mask stacked.  Consumers that want a per-frame view can
+        # broadcast against the 2-D maps.
+        out["ds"] = xr.Dataset(
+            {
+                "intensity": (("frame", "row", "col"), ds_images),
+                "q_abs": (("row", "col"), ds_q2d),
+                "q_horizontal": (("row", "col"), ds_qh2d),
+                "q_vertical": (("row", "col"), ds_qv2d),
+                "mask": (("frame", "row", "col"), ds_masks),
+            },
+            coords={"frame": np.arange(n_frames, dtype=int)},
+        )
+    else:
+        out["ds"] = None
     print(f"  [integrate_saxs] output build: "
           f"{_time.perf_counter() - _t_build:.3f}s")
     print(f"  [integrate_saxs] TOTAL: "
@@ -2757,8 +2985,16 @@ def integrate_waxs(
     dezinger_kernel: int = 5,
     cache_geometry: bool = True,
     pixel_splitting: int = 1,
+    build_detector_ds: bool | None = None,
+    build_frame_qchi: bool = True,
+    frame_qchi_store: "str | Path | None" = None,
 ) -> dict[str, Any]:
-    """WAXS reduction via MultiPanelArcDetector per arc-angle frame."""
+    """WAXS reduction via MultiPanelArcDetector per arc-angle frame.
+
+    When *frame_qchi_store* is given, per-frame ``(q, chi)`` maps are streamed
+    to that zarr path and ``out['q_chi_frames']`` is returned lazily (dask-
+    backed), keeping peak memory at a single frame.  See :class:`_ZarrFrameWriter`.
+    """
     _t0_waxs = _time.perf_counter()
     attrs = waxs_raw.attrs
     if cal is None:
@@ -2867,11 +3103,29 @@ def integrate_waxs(
     ds_int_frames, ds_qabs_frames = [], []
     ds_qh_frames, ds_qv_frames, ds_mask_frames = [], [], []
 
+    # Per-geometry bin-plan cache.  WAXS geometry varies with arc angle, but
+    # frames that share an (angle, wavelength) key share a q/chi map and thus a
+    # pixel->bin mapping.  For a fast raster at fixed arc there is exactly one
+    # key, so the plan is built once and reused for every frame — the same big
+    # win as SAXS.  Keyed identically to ``_geo_cache``.
+    _bin_plans: dict[tuple, _SplitBinPlan] = {}
+
+    # Detector-space ``ds`` is large (per-frame intensity + geometry + mask) and
+    # never consumed by the reduction; skip it (and its per-frame list
+    # accumulation) for big scans unless explicitly requested.
+    make_ds = _resolve_build_detector_ds(build_detector_ds, len(arc_angles), "waxs")
+
+    qchi_writer = (
+        _ZarrFrameWriter(frame_qchi_store, len(arc_angles), q_grid, chi_grid)
+        if frame_qchi_store is not None else None
+    )
+
     _t_loop = _time.perf_counter()
     _t_waxs_dez = 0.0
     _t_waxs_mask = 0.0
     _t_waxs_hist = 0.0
     _t_waxs_qchi = 0.0
+    _t_waxs_plan = 0.0
     for fi, theta in enumerate(arc_angles):
         theta_f = float(theta)
         wl_nm = float(wavelength_per_frame_nm[fi])
@@ -2923,64 +3177,79 @@ def integrate_waxs(
             valid &= mask_rot
 
         mask_use = valid if mask_rot is None else mask_rot
-        ds_int_frames.append(np.where(mask_use, img_rot, np.nan))
-        ds_qabs_frames.append(qabs_px)
-        ds_qh_frames.append(qx_px)
-        ds_qv_frames.append(qy_px)
-        ds_mask_frames.append(mask_use.astype(bool))
+        if make_ds:
+            ds_int_frames.append(np.where(mask_use, img_rot, np.nan))
+            ds_qabs_frames.append(qabs_px)
+            ds_qh_frames.append(qx_px)
+            ds_qv_frames.append(qy_px)
+            ds_mask_frames.append(mask_use.astype(bool))
 
-        q_sel = qabs_px[valid].ravel()
-        chi_sel = chi_px[valid].ravel()
-        I_sel = img_rot[valid].ravel()
+        _tp = _time.perf_counter()
+        plan = _bin_plans.get(geo_key)
+        if plan is None:
+            plan = _SplitBinPlan(qabs_px, chi_px, q_edges, chi_edges,
+                                 pixel_splitting=pixel_splitting)
+            _bin_plans[geo_key] = plan
+        _t_waxs_plan += _time.perf_counter() - _tp
 
         _th = _time.perf_counter()
-        I_hist, N_hist = _histogram2d_pixel_split(
-            qabs_px, chi_px, img_rot, valid, q_edges, chi_edges,
-            pixel_splitting=pixel_splitting,
-        )
+        I_hist, N_hist = plan.integrate_frame(img_rot, valid)
         _t_waxs_hist += _time.perf_counter() - _th
         accum_I += I_hist
         accum_N += N_hist
         _tq = _time.perf_counter()
         frame_out = _qchi_and_iq(I_hist, N_hist, q_grid, chi_grid)
-        frame_qchi.append(frame_out["q_chi"])
+        if qchi_writer is not None:
+            qchi_writer.write(fi, frame_out["q_chi"]["intensity"].values,
+                              frame_out["q_chi"]["counts"].values)
+        elif build_frame_qchi:
+            frame_qchi.append(frame_out["q_chi"])
         frame_iq.append(frame_out["iq"])
         _t_waxs_qchi += _time.perf_counter() - _tq
 
     print(f"  [integrate_waxs] per-frame loop ({len(arc_angles)} frames): "
           f"{_time.perf_counter() - _t_loop:.3f}s "
           f"(mask={_t_waxs_mask:.3f}s, dez={_t_waxs_dez:.3f}s, "
-          f"hist={_t_waxs_hist:.3f}s, qchi={_t_waxs_qchi:.3f}s)")
+          f"plan={_t_waxs_plan:.3f}s, hist={_t_waxs_hist:.3f}s, "
+          f"qchi={_t_waxs_qchi:.3f}s)")
     _t_build = _time.perf_counter()
     out = _qchi_and_iq(accum_I, accum_N, q_grid, chi_grid)
-    out["q_chi_frames"] = _stack_qchi_frames(frame_qchi)
+    if qchi_writer is not None:
+        out["q_chi_frames"] = qchi_writer.dataset()
+    elif build_frame_qchi:
+        out["q_chi_frames"] = _stack_qchi_frames(frame_qchi)
+    else:
+        out["q_chi_frames"] = None
     out["iq_frames"] = _stack_iq_frames(frame_iq)
-    out["ds"] = xr.Dataset(
-        {
-            "intensity": (
-                ("frame", "row", "col"),
-                np.asarray(ds_int_frames, dtype=float),
-            ),
-            "q_abs": (
-                ("frame", "row", "col"),
-                np.asarray(ds_qabs_frames, dtype=float),
-            ),
-            "q_horizontal": (
-                ("frame", "row", "col"),
-                np.asarray(ds_qh_frames, dtype=float),
-            ),
-            "q_vertical": (
-                ("frame", "row", "col"),
-                np.asarray(ds_qv_frames, dtype=float),
-            ),
-            "mask": (
-                ("frame", "row", "col"),
-                np.asarray(ds_mask_frames, dtype=bool),
-            ),
-            "waxs_arc": (("frame",), np.asarray(arc_angles, dtype=float)),
-        },
-        coords={"frame": np.arange(len(arc_angles), dtype=int)},
-    )
+    if make_ds:
+        out["ds"] = xr.Dataset(
+            {
+                "intensity": (
+                    ("frame", "row", "col"),
+                    np.asarray(ds_int_frames, dtype=float),
+                ),
+                "q_abs": (
+                    ("frame", "row", "col"),
+                    np.asarray(ds_qabs_frames, dtype=float),
+                ),
+                "q_horizontal": (
+                    ("frame", "row", "col"),
+                    np.asarray(ds_qh_frames, dtype=float),
+                ),
+                "q_vertical": (
+                    ("frame", "row", "col"),
+                    np.asarray(ds_qv_frames, dtype=float),
+                ),
+                "mask": (
+                    ("frame", "row", "col"),
+                    np.asarray(ds_mask_frames, dtype=bool),
+                ),
+                "waxs_arc": (("frame",), np.asarray(arc_angles, dtype=float)),
+            },
+            coords={"frame": np.arange(len(arc_angles), dtype=int)},
+        )
+    else:
+        out["ds"] = None
     print(f"  [integrate_waxs] output build: "
           f"{_time.perf_counter() - _t_build:.3f}s")
     print(f"  [integrate_waxs] TOTAL: "
@@ -3019,6 +3288,9 @@ def reduce_smi_combined(
     waxs_beam_col_per_arc_deg: float = 0.08,
     cache_geometry: bool = True,
     pixel_splitting: int = 1,
+    build_detector_ds: bool | None = None,
+    build_frame_qchi: bool = True,
+    frame_qchi_store: "str | Path | None" = "auto",
     image_cache_path: str | Path | None = "auto",
     populate_disk_cache: bool = True,
 ) -> CombinedReductionResult:
@@ -3097,6 +3369,23 @@ def reduce_smi_combined(
         pixel into an NxN grid and distribute intensity fractionally across
         bins using gradient-based interpolation of the q/chi maps.  Typical
         values are 2–4.
+    build_detector_ds : bool or None
+        Whether to build the per-frame *detector-space* dataset
+        (``result.saxs['ds']`` / ``result.waxs['ds']`` — full image stack plus
+        q-maps and masks).  This is large and not used by the reduction itself.
+        ``None`` (default) is auto: built for small scans, skipped (with a
+        warning) above ~50 frames to bound memory.  ``True``/``False`` force it.
+    build_frame_qchi : bool
+        Whether to produce the per-frame ``(q, chi)`` stacks at all (default
+        True).  Set False to skip them entirely (the merged products and
+        per-frame I(q) are unaffected).
+    frame_qchi_store : str, Path, None, or "auto"
+        Where to keep the per-frame ``(q, chi)`` stacks.  ``"auto"`` (default)
+        streams them to a per-uid zarr store under the disk cache dir for large
+        scans (> ~50 frames) and returns ``result.*['q_chi_frames']`` as a
+        **lazy, dask-backed** dataset — so the multi-GB ``(frame, q, chi)`` array
+        never lives in RAM — while small scans stay in memory.  Pass an explicit
+        directory to always stream there, or ``None`` to always keep in memory.
     image_cache_path : str, Path, None, or "auto"
         Path to a pre-cached HDF5 image file (SMI Browser disk cache).
         If ``"auto"`` (default), automatically checks
@@ -3168,6 +3457,31 @@ def reduce_smi_combined(
     has_saxs = saxs_raw is not None
     has_waxs = waxs_raw is not None
     t_load = _time.perf_counter()
+
+    # Resolve per-frame q-chi streaming store.  ``"auto"`` (default) streams the
+    # per-frame (q, chi) stacks to a per-uid zarr under the disk cache dir for
+    # large scans — keeping the giant (frame, q, chi) arrays off the heap and
+    # returning them lazily (dask-backed) — while small scans stay in memory.
+    # ``None`` forces in-memory; an explicit path always streams there.
+    def _frame_counts() -> int:
+        n = 0
+        if has_saxs:
+            n = max(n, saxs_raw.shape[0] if saxs_raw.ndim > 2 else 1)
+        if has_waxs:
+            n = max(n, waxs_raw.shape[0] if waxs_raw.ndim > 2 else 1)
+        return n
+
+    if frame_qchi_store is None:
+        _store_dir = None
+    elif frame_qchi_store == "auto":
+        _store_dir = (
+            _cache_dir() / f"{uid}_qchi"
+            if _frame_counts() > _DETECTOR_DS_AUTO_MAX_FRAMES else None
+        )
+    else:
+        _store_dir = Path(frame_qchi_store)
+    saxs_qchi_store = str(_store_dir / "saxs_qchi.zarr") if _store_dir is not None else None
+    waxs_qchi_store = str(_store_dir / "waxs_qchi.zarr") if _store_dir is not None else None
 
     # Populate disk cache for future runs if data was fetched from tiled
     if populate_disk_cache and _cache_was_missing:
@@ -3253,6 +3567,9 @@ def reduce_smi_combined(
             dezinger_kernel=dezinger_kernel,
             cache_geometry=cache_geometry,
             pixel_splitting=pixel_splitting,
+            build_detector_ds=build_detector_ds,
+            build_frame_qchi=build_frame_qchi,
+            frame_qchi_store=saxs_qchi_store,
         )
         t_saxs_end = _time.perf_counter()
 
@@ -3356,6 +3673,9 @@ def reduce_smi_combined(
             dezinger_kernel=dezinger_kernel,
             cache_geometry=cache_geometry,
             pixel_splitting=pixel_splitting,
+            build_detector_ds=build_detector_ds,
+            build_frame_qchi=build_frame_qchi,
+            frame_qchi_store=waxs_qchi_store,
         )
         t_waxs_end = _time.perf_counter()
 
