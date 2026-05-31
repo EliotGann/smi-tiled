@@ -65,6 +65,13 @@ WAXS_IMAGE_FIELD = "pil900KW_image"
 WAXS_ARC_FIELD   = "waxs_arc"
 WAXS_BSX_FIELD   = "waxs_bsx"
 
+#: Frames per block when loading/integrating image stacks lazily.  Detector
+#: arrays are chunked one-frame-per-chunk on the tiled server; computing ~32 at
+#: a time keeps the dask scheduler's per-chunk parallelism (near-full load
+#: speed) while bounding peak raw memory to one block instead of the whole
+#: stack (~0.6 GB vs ~16 GB for 800 SAXS frames).
+IMAGE_BLOCK_FRAMES = 32
+
 DEFAULT_TILED_URI = "https://tiled.nsls2.bnl.gov"
 DEFAULT_CATALOG   = "smi/migration"
 DEFAULT_ENERGY_KEV = 16.1
@@ -274,6 +281,60 @@ def _read_cached_images(cache_path: str | Path, field: str) -> np.ndarray | None
             if key not in f:
                 return None
             return f[key][...]
+    except Exception:
+        return None
+
+
+def _read_cached_images_lazy(cache_path: str | Path, field: str):
+    """Lazy, block-chunked view of a cached image stack as a dask array.
+
+    Returns a dask array backed by the on-disk HDF5 dataset (chunked
+    ``IMAGE_BLOCK_FRAMES`` frames at a time) so a consumer can pull blocks
+    without materializing the whole stack in RAM.  The HDF5 file is held open
+    by the returned array's task graph for as long as the array is alive.
+    Returns ``None`` if dask/h5py are unavailable or the field is absent
+    (callers fall back to the eager :func:`_read_cached_images`).
+    """
+    try:
+        import h5py
+        import dask.array as da
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+    try:
+        f = h5py.File(cache_path, "r")  # intentionally left open (lazy reads)
+        key = f"images/{field}"
+        if key not in f:
+            f.close()
+            return None
+        dset = f[key]
+        chunks = (IMAGE_BLOCK_FRAMES,) + dset.shape[1:]
+        return da.from_array(dset, chunks=chunks)
+    except Exception:
+        return None
+
+
+def _read_primary_field_lazy(dask_run: Any, field: str):
+    """Lazy dask-array read of a primary detector field via a dask client.
+
+    *dask_run* must be a run opened through a tiled client created with
+    ``structure_clients="dask"`` so that ``node.read()`` yields a dask array
+    (per-frame chunked).  Returns ``None`` on any failure so callers fall back
+    to the eager :func:`_read_primary_field`.
+    """
+    try:
+        import dask.array as da
+        node = _get_primary_field_node(dask_run, field)
+        darr = node.read()
+        if not hasattr(darr, "compute"):
+            return None
+        # Tiled may return 4-D (step, exposures, row, col) — average exposures.
+        if darr.ndim == 4:
+            darr = da.nanmean(darr, axis=1)
+        return darr
     except Exception:
         return None
 
@@ -1649,6 +1710,7 @@ def load_saxs_raw(
     geo: SAXSGeometry,
     extra_attrs: dict[str, Any] | None = None,
     image_cache_path: str | Path | None = None,
+    dask_run: Any | None = None,
 ) -> xr.DataArray:
     """
     Load SAXS (Pilatus 2M) raw images from a tiled run as an xr.DataArray.
@@ -1666,18 +1728,22 @@ def load_saxs_raw(
         attrs: PyHyperScattering-compatible geometry + SMI-specific extras.
     """
     images = None
+    _src = "cache"
     _t_img = time.perf_counter()
     if image_cache_path is not None:
-        images = _read_cached_images(image_cache_path, SAXS_IMAGE_FIELD)
-    if images is not None:
-        _dt = time.perf_counter() - _t_img
-        print(f"[SMILoader] SAXS images loaded from cache in {_dt:.3f}s "
-              f"(shape={images.shape})")
-    else:
-        images = _read_primary_field(run, SAXS_IMAGE_FIELD)
-        _dt = time.perf_counter() - _t_img
-        print(f"[SMILoader] SAXS images loaded from tiled in {_dt:.3f}s "
-              f"(shape={images.shape})")
+        images = _read_cached_images_lazy(image_cache_path, SAXS_IMAGE_FIELD)
+        if images is None:
+            images = _read_cached_images(image_cache_path, SAXS_IMAGE_FIELD)
+    if images is None:
+        _src = "tiled"
+        if dask_run is not None:
+            images = _read_primary_field_lazy(dask_run, SAXS_IMAGE_FIELD)
+        if images is None:
+            images = _read_primary_field(run, SAXS_IMAGE_FIELD)
+    _dt = time.perf_counter() - _t_img
+    _lazy = hasattr(images, "compute")
+    print(f"[SMILoader] SAXS images {'opened (lazy)' if _lazy else 'loaded'} "
+          f"from {_src} in {_dt:.3f}s (shape={images.shape})")
     start = run.metadata.get("start", {})
     sample_name = start.get("sample_name", "")
     name_geo = parse_sample_name_geometry(sample_name)
@@ -1779,6 +1845,7 @@ def load_waxs_raw(
     geo: WAXSGeometry,
     extra_attrs: dict[str, Any] | None = None,
     image_cache_path: str | Path | None = None,
+    dask_run: Any | None = None,
 ) -> xr.DataArray:
     """
     Load WAXS (900KW) raw images from a tiled run as an xr.DataArray.
@@ -1810,18 +1877,22 @@ def load_waxs_raw(
             decode with ``json.loads(da.attrs['smi_panels'])``)
     """
     images = None
+    _src = "cache"
     _t_img = time.perf_counter()
     if image_cache_path is not None:
-        images = _read_cached_images(image_cache_path, WAXS_IMAGE_FIELD)
-    if images is not None:
-        _dt = time.perf_counter() - _t_img
-        print(f"[SMILoader] WAXS images loaded from cache in {_dt:.3f}s "
-              f"(shape={images.shape})")
-    else:
-        images = _read_primary_field(run, WAXS_IMAGE_FIELD)
-        _dt = time.perf_counter() - _t_img
-        print(f"[SMILoader] WAXS images loaded from tiled in {_dt:.3f}s "
-              f"(shape={images.shape})")
+        images = _read_cached_images_lazy(image_cache_path, WAXS_IMAGE_FIELD)
+        if images is None:
+            images = _read_cached_images(image_cache_path, WAXS_IMAGE_FIELD)
+    if images is None:
+        _src = "tiled"
+        if dask_run is not None:
+            images = _read_primary_field_lazy(dask_run, WAXS_IMAGE_FIELD)
+        if images is None:
+            images = _read_primary_field(run, WAXS_IMAGE_FIELD)
+    _dt = time.perf_counter() - _t_img
+    _lazy = hasattr(images, "compute")
+    print(f"[SMILoader] WAXS images {'opened (lazy)' if _lazy else 'loaded'} "
+          f"from {_src} in {_dt:.3f}s (shape={images.shape})")
     start  = run.metadata.get("start", {})
     sample_name = start.get("sample_name", "")
     name_geo = parse_sample_name_geometry(sample_name)
@@ -2276,6 +2347,7 @@ class TiledSMISWAXSLoader:
         self.api_key = api_key
         self._root_client = None
         self._catalog_client = None
+        self._dask_catalog_client = None
 
     # ------------------------------------------------------------------
     # Authentication helpers
@@ -2330,6 +2402,29 @@ class TiledSMISWAXSLoader:
 
     def _get_run(self, uid: str) -> Any:
         return self._get_catalog()[uid]
+
+    def _get_dask_run(self, uid: str) -> Any | None:
+        """Return *uid*'s run via a tiled client using dask structure clients.
+
+        Image reads through this run yield lazy, per-frame-chunked dask arrays,
+        which load ~5-7x faster than the hand-rolled chunked reader and let the
+        integrator pull frames in blocks.  Returns ``None`` if a dask client
+        cannot be created (caller falls back to the eager read path).
+        """
+        try:
+            if self._dask_catalog_client is None:
+                from tiled.client import from_uri
+                kwargs: dict[str, Any] = {"structure_clients": "dask"}
+                if self.api_key is not None:
+                    kwargs["api_key"] = self.api_key
+                node = from_uri(self.tiled_uri, **kwargs)
+                for part in self.catalog.split("/"):
+                    if part:
+                        node = node[part]
+                self._dask_catalog_client = node
+            return self._dask_catalog_client[uid]
+        except Exception:
+            return None
 
     def peekAtMd(self, uid: str, detector: str = "saxs") -> dict[str, Any]:
         """Return geometry metadata dict without loading images."""
@@ -2392,13 +2487,18 @@ class TiledSMISWAXSLoader:
         if image_cache_path is not None:
             _prepopulate_caches_from_h5(run, image_cache_path)
 
+        # Dask-client run for lazy, block-chunked image reads (falls back to
+        # the eager reader inside load_*_raw if unavailable).
+        dask_run = self._get_dask_run(uid)
+
         if detector == "saxs":
             if not _has_primary_field(run, SAXS_IMAGE_FIELD):
                 return None
             geo = resolve_saxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
-            return load_saxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
+            return load_saxs_raw(run, geo, extra_attrs=extra_attrs,
+                                 image_cache_path=image_cache_path, dask_run=dask_run)
 
         if detector == "waxs":
             if not _has_primary_field(run, WAXS_IMAGE_FIELD):
@@ -2406,7 +2506,8 @@ class TiledSMISWAXSLoader:
             geo = resolve_waxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
-            return load_waxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
+            return load_waxs_raw(run, geo, extra_attrs=extra_attrs,
+                                 image_cache_path=image_cache_path, dask_run=dask_run)
 
         raise ValueError(
             f"Unknown detector '{detector}'. Expected 'saxs' or 'waxs'."
