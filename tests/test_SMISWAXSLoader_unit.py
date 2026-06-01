@@ -257,6 +257,47 @@ class TestResolveSAXSGeometry:
         # 4064 eV → 4.064 keV → 4064 eV
         assert geo.energy_ev == pytest.approx(4064.0)
 
+    def test_motor_present_does_not_shift_beam_center(self):
+        # Regression: the EPICS beam-center PVs already track motor_x/y, so the
+        # resolved center must equal the metadata PV even when motors are far
+        # from the (legacy) reference position.  Mirrors AgBh scan
+        # f28cbab1-… (motor_y=-18.5); before the fix the default motor slopes
+        # double-counted and pushed beam_row ~120 px off (877 instead of 1003).
+        run = _FakeRun(
+            primary_fields={},
+            baseline={
+                "pil2M_beam_center_x_px": 750.7,
+                "pil2M_beam_center_y_px": 1003.5,
+                "pil2M_motor_x": 0.0,
+                "pil2M_motor_y": -18.5,
+                "pil2M_motor_z": 2000.0,
+                "energy_energy": 16100.0,
+            },
+            start={"sample_name": "EG_AGB_16.10keV_wa15.0_sdd2.0m"},
+        )
+        geo = L.resolve_saxs_geometry(run)
+        # No motor-driven shift: resolved center == metadata PV (motor_z slope
+        # is a negligible ~1e-4 px/mm, well within 1 px).
+        assert geo.beam_center_row_px == pytest.approx(1003.5, abs=1.0)
+        assert geo.beam_center_col_px == pytest.approx(750.7, abs=1.0)
+
+    def test_motor_slope_override_still_applies(self):
+        # The per-call override hook must remain functional so a future static-
+        # PV detector can re-enable a slope.  With the legacy 5.9963 px/mm slope
+        # re-supplied, the old additive (motor_y - ref) * slope shift returns.
+        run = _FakeRun(
+            primary_fields={},
+            baseline={
+                "pil2M_beam_center_x_px": 750.7,
+                "pil2M_beam_center_y_px": 1003.5,
+                "pil2M_motor_y": -18.5,
+            },
+            start={"sample_name": "test"},
+        )
+        geo = L.resolve_saxs_geometry(run, beam_row_px_per_motor_y_mm=5.9963)
+        expected = 1003.5 + (-18.5 - L._SAXS_MOTOR_Y_REF_MM) * 5.9963
+        assert geo.beam_center_row_px == pytest.approx(expected, abs=0.5)
+
 
 # ===========================================================================
 # resolve_waxs_geometry

@@ -65,6 +65,13 @@ WAXS_IMAGE_FIELD = "pil900KW_image"
 WAXS_ARC_FIELD   = "waxs_arc"
 WAXS_BSX_FIELD   = "waxs_bsx"
 
+#: Frames per block when loading/integrating image stacks lazily.  Detector
+#: arrays are chunked one-frame-per-chunk on the tiled server; computing ~32 at
+#: a time keeps the dask scheduler's per-chunk parallelism (near-full load
+#: speed) while bounding peak raw memory to one block instead of the whole
+#: stack (~0.6 GB vs ~16 GB for 800 SAXS frames).
+IMAGE_BLOCK_FRAMES = 32
+
 DEFAULT_TILED_URI = "https://tiled.nsls2.bnl.gov"
 DEFAULT_CATALOG   = "smi/migration"
 DEFAULT_ENERGY_KEV = 16.1
@@ -81,22 +88,28 @@ _SAXS_DEFAULT_BEAM_DELTA_ROW_PX =  0.0        # additive correction to metadata 
 _SAXS_DEFAULT_BEAM_DELTA_COL_PX =  0.0        # additive correction to metadata col
 
 # SAXS motor-driven geometry corrections.
-# The baseline EPICS PVs (pil2M_beam_center_x_px, pil2M_beam_center_y_px) are
-# static calibration values, set once at a known motor configuration.  When
-# the detector translates (pil2M_motor_x/y) or the sample moves along the beam
-# (piezo_z), the physical beam position on the detector and the effective
-# sample-detector distance both shift.  These constants encode the linear
-# mapping; values are overrideable per-call.  Calibrated from the AGB grid
-# scan b0f165c4-203e-4d58-af17-916620b974c2 (regression residuals ≤1 px).
-_SAXS_MOTOR_X_REF_MM: float = 1.88             # baseline EPICS bc_col matches actual at this motor_x
-_SAXS_MOTOR_Y_REF_MM: float = 2.45             # baseline EPICS bc_row matches actual at this motor_y
+# IMPORTANT: the EPICS PVs (pil2M_beam_center_x_px, pil2M_beam_center_y_px) are
+# NOT static — they already track the detector translation motors.  Measured
+# across scans the PV moves with motor_y at ~6 px/mm (e.g. ~1107 px at
+# motor_y=0, ~1003.5 px at motor_y=-18.5 mm), i.e. it already encodes the
+# detector x/y position.  Applying an additional (motor - ref) * slope
+# correction on top therefore DOUBLE-COUNTS and pushes the beam center ~120 px
+# off (confirmed against AgBh ring fits on EG_AGB scans).  Hence the motor_x/y
+# px-per-mm slopes default to 0.0: by default the resolved beam center equals
+# the live metadata PV.  Set these non-zero ONLY for a future detector whose
+# beam-center PV is a static, position-independent calibration value.  Values
+# remain overrideable per-call (beam_col_px_per_motor_x_mm, ...).
+_SAXS_MOTOR_X_REF_MM: float = 1.88             # reference motor_x (unused while slope=0; kept for the override API)
+_SAXS_MOTOR_Y_REF_MM: float = 2.45             # reference motor_y (unused while slope=0; kept for the override API)
 _SAXS_MOTOR_Z_REF_MM: float = 0.0              # motor_z reference (BC drift relative to here)
 _SAXS_PIEZO_Z_REF_UM: float = 0.0              # piezo_z reference (offset absorbed in DISTANCE_DELTA)
-# px/mm slopes from regression: motor_x→bc_col slope = 5.821 = 1/0.172 exactly.
-# motor_y→bc_row slope ≈ 5.996 (slightly steeper than nominal; possibly the
-# stage is not perfectly perpendicular).
-_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM: float = +5.8211
-_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM: float = +5.9963
+# motor_x/y -> beam-center slopes.  Default 0.0 because the EPICS beam-center
+# PVs already track motor_x/y (see note above); a non-zero slope here would
+# double-count.  (The historical regression on AGB grid scan b0f165c4 found
+# ~5.82/5.99 px/mm — that is the rate at which the PV *itself* moves, not an
+# extra correction to add.)
+_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM: float = 0.0
+_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM: float = 0.0
 # motor_z → BC drift: if the beam is perfectly along the motor_z axis,
 # these are zero.  Non-zero values indicate small misalignment of the
 # beam axis vs the motor_z translation axis, derived from an AGB
@@ -268,6 +281,60 @@ def _read_cached_images(cache_path: str | Path, field: str) -> np.ndarray | None
             if key not in f:
                 return None
             return f[key][...]
+    except Exception:
+        return None
+
+
+def _read_cached_images_lazy(cache_path: str | Path, field: str):
+    """Lazy, block-chunked view of a cached image stack as a dask array.
+
+    Returns a dask array backed by the on-disk HDF5 dataset (chunked
+    ``IMAGE_BLOCK_FRAMES`` frames at a time) so a consumer can pull blocks
+    without materializing the whole stack in RAM.  The HDF5 file is held open
+    by the returned array's task graph for as long as the array is alive.
+    Returns ``None`` if dask/h5py are unavailable or the field is absent
+    (callers fall back to the eager :func:`_read_cached_images`).
+    """
+    try:
+        import h5py
+        import dask.array as da
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+    try:
+        f = h5py.File(cache_path, "r")  # intentionally left open (lazy reads)
+        key = f"images/{field}"
+        if key not in f:
+            f.close()
+            return None
+        dset = f[key]
+        chunks = (IMAGE_BLOCK_FRAMES,) + dset.shape[1:]
+        return da.from_array(dset, chunks=chunks)
+    except Exception:
+        return None
+
+
+def _read_primary_field_lazy(dask_run: Any, field: str):
+    """Lazy dask-array read of a primary detector field via a dask client.
+
+    *dask_run* must be a run opened through a tiled client created with
+    ``structure_clients="dask"`` so that ``node.read()`` yields a dask array
+    (per-frame chunked).  Returns ``None`` on any failure so callers fall back
+    to the eager :func:`_read_primary_field`.
+    """
+    try:
+        import dask.array as da
+        node = _get_primary_field_node(dask_run, field)
+        darr = node.read()
+        if not hasattr(darr, "compute"):
+            return None
+        # Tiled may return 4-D (step, exposures, row, col) — average exposures.
+        if darr.ndim == 4:
+            darr = da.nanmean(darr, axis=1)
+        return darr
     except Exception:
         return None
 
@@ -1643,6 +1710,7 @@ def load_saxs_raw(
     geo: SAXSGeometry,
     extra_attrs: dict[str, Any] | None = None,
     image_cache_path: str | Path | None = None,
+    dask_run: Any | None = None,
 ) -> xr.DataArray:
     """
     Load SAXS (Pilatus 2M) raw images from a tiled run as an xr.DataArray.
@@ -1660,18 +1728,22 @@ def load_saxs_raw(
         attrs: PyHyperScattering-compatible geometry + SMI-specific extras.
     """
     images = None
+    _src = "cache"
     _t_img = time.perf_counter()
     if image_cache_path is not None:
-        images = _read_cached_images(image_cache_path, SAXS_IMAGE_FIELD)
-    if images is not None:
-        _dt = time.perf_counter() - _t_img
-        print(f"[SMILoader] SAXS images loaded from cache in {_dt:.3f}s "
-              f"(shape={images.shape})")
-    else:
-        images = _read_primary_field(run, SAXS_IMAGE_FIELD)
-        _dt = time.perf_counter() - _t_img
-        print(f"[SMILoader] SAXS images loaded from tiled in {_dt:.3f}s "
-              f"(shape={images.shape})")
+        images = _read_cached_images_lazy(image_cache_path, SAXS_IMAGE_FIELD)
+        if images is None:
+            images = _read_cached_images(image_cache_path, SAXS_IMAGE_FIELD)
+    if images is None:
+        _src = "tiled"
+        if dask_run is not None:
+            images = _read_primary_field_lazy(dask_run, SAXS_IMAGE_FIELD)
+        if images is None:
+            images = _read_primary_field(run, SAXS_IMAGE_FIELD)
+    _dt = time.perf_counter() - _t_img
+    _lazy = hasattr(images, "compute")
+    print(f"[SMILoader] SAXS images {'opened (lazy)' if _lazy else 'loaded'} "
+          f"from {_src} in {_dt:.3f}s (shape={images.shape})")
     start = run.metadata.get("start", {})
     sample_name = start.get("sample_name", "")
     name_geo = parse_sample_name_geometry(sample_name)
@@ -1773,6 +1845,7 @@ def load_waxs_raw(
     geo: WAXSGeometry,
     extra_attrs: dict[str, Any] | None = None,
     image_cache_path: str | Path | None = None,
+    dask_run: Any | None = None,
 ) -> xr.DataArray:
     """
     Load WAXS (900KW) raw images from a tiled run as an xr.DataArray.
@@ -1804,18 +1877,22 @@ def load_waxs_raw(
             decode with ``json.loads(da.attrs['smi_panels'])``)
     """
     images = None
+    _src = "cache"
     _t_img = time.perf_counter()
     if image_cache_path is not None:
-        images = _read_cached_images(image_cache_path, WAXS_IMAGE_FIELD)
-    if images is not None:
-        _dt = time.perf_counter() - _t_img
-        print(f"[SMILoader] WAXS images loaded from cache in {_dt:.3f}s "
-              f"(shape={images.shape})")
-    else:
-        images = _read_primary_field(run, WAXS_IMAGE_FIELD)
-        _dt = time.perf_counter() - _t_img
-        print(f"[SMILoader] WAXS images loaded from tiled in {_dt:.3f}s "
-              f"(shape={images.shape})")
+        images = _read_cached_images_lazy(image_cache_path, WAXS_IMAGE_FIELD)
+        if images is None:
+            images = _read_cached_images(image_cache_path, WAXS_IMAGE_FIELD)
+    if images is None:
+        _src = "tiled"
+        if dask_run is not None:
+            images = _read_primary_field_lazy(dask_run, WAXS_IMAGE_FIELD)
+        if images is None:
+            images = _read_primary_field(run, WAXS_IMAGE_FIELD)
+    _dt = time.perf_counter() - _t_img
+    _lazy = hasattr(images, "compute")
+    print(f"[SMILoader] WAXS images {'opened (lazy)' if _lazy else 'loaded'} "
+          f"from {_src} in {_dt:.3f}s (shape={images.shape})")
     start  = run.metadata.get("start", {})
     sample_name = start.get("sample_name", "")
     name_geo = parse_sample_name_geometry(sample_name)
@@ -2270,6 +2347,7 @@ class TiledSMISWAXSLoader:
         self.api_key = api_key
         self._root_client = None
         self._catalog_client = None
+        self._dask_catalog_client = None
 
     # ------------------------------------------------------------------
     # Authentication helpers
@@ -2324,6 +2402,29 @@ class TiledSMISWAXSLoader:
 
     def _get_run(self, uid: str) -> Any:
         return self._get_catalog()[uid]
+
+    def _get_dask_run(self, uid: str) -> Any | None:
+        """Return *uid*'s run via a tiled client using dask structure clients.
+
+        Image reads through this run yield lazy, per-frame-chunked dask arrays,
+        which load ~5-7x faster than the hand-rolled chunked reader and let the
+        integrator pull frames in blocks.  Returns ``None`` if a dask client
+        cannot be created (caller falls back to the eager read path).
+        """
+        try:
+            if self._dask_catalog_client is None:
+                from tiled.client import from_uri
+                kwargs: dict[str, Any] = {"structure_clients": "dask"}
+                if self.api_key is not None:
+                    kwargs["api_key"] = self.api_key
+                node = from_uri(self.tiled_uri, **kwargs)
+                for part in self.catalog.split("/"):
+                    if part:
+                        node = node[part]
+                self._dask_catalog_client = node
+            return self._dask_catalog_client[uid]
+        except Exception:
+            return None
 
     def peekAtMd(self, uid: str, detector: str = "saxs") -> dict[str, Any]:
         """Return geometry metadata dict without loading images."""
@@ -2386,13 +2487,18 @@ class TiledSMISWAXSLoader:
         if image_cache_path is not None:
             _prepopulate_caches_from_h5(run, image_cache_path)
 
+        # Dask-client run for lazy, block-chunked image reads (falls back to
+        # the eager reader inside load_*_raw if unavailable).
+        dask_run = self._get_dask_run(uid)
+
         if detector == "saxs":
             if not _has_primary_field(run, SAXS_IMAGE_FIELD):
                 return None
             geo = resolve_saxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
-            return load_saxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
+            return load_saxs_raw(run, geo, extra_attrs=extra_attrs,
+                                 image_cache_path=image_cache_path, dask_run=dask_run)
 
         if detector == "waxs":
             if not _has_primary_field(run, WAXS_IMAGE_FIELD):
@@ -2400,7 +2506,8 @@ class TiledSMISWAXSLoader:
             geo = resolve_waxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
-            return load_waxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
+            return load_waxs_raw(run, geo, extra_attrs=extra_attrs,
+                                 image_cache_path=image_cache_path, dask_run=dask_run)
 
         raise ValueError(
             f"Unknown detector '{detector}'. Expected 'saxs' or 'waxs'."

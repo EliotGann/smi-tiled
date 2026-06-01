@@ -38,3 +38,4 @@ docs/source/api/generated/
 
 # Stray logs
 *.log
+scratch/

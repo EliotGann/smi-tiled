@@ -34,29 +34,30 @@ sign convention `chi=0` along `+x` and `chi=90°` along `+y`.
 
 ## Motor → pixel mapping (SAXS)
 
-For the Pilatus 2M, the loader applies these linear corrections to the
-EPICS baseline beam center:
+The EPICS beam-center PVs (`pil2M_beam_center_x_px`, `pil2M_beam_center_y_px`)
+**already track the detector translation motors** — the PV value itself moves
+with `motor_x`/`motor_y` at roughly the pixel pitch (~5.8/6.0 px/mm). The loader
+therefore applies **no** additional motor_x/y correction by default:
 
 ```python
 # Default constants in smi_tiled.loader:
-_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM = +5.8211    # ≈ 1 / 0.172 mm/pixel
-_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM = +5.9963    # slightly steeper than nominal
+_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM = 0.0        # PV already tracks motor_x → no extra correction
+_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM = 0.0        # PV already tracks motor_y → no extra correction
 _SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM = +0.000265  # negligible — beam well-aligned to z
 _SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM = -0.000350  # negligible
 ```
 
-### Sign interpretation
+### Why the x/y slopes are 0.0
 
-- `+motor_x_mm` → `+beam_col_px` (the detector translates +x in lab,
-  but the beam stays fixed, so the beam appears at a higher column
-  index).
-- `+motor_y_mm` → `+beam_row_px` (similar — detector moves up, beam
-  appears at higher row index, i.e. lower in the image when viewed
-  in normal orientation).
-
-The motor stage's mechanical y axis differs from the detector's image y
-axis: the **row** axis of the array goes "downward" in image memory but
-"upward" in the lab.  The +5.9963 slope captures the net effect.
+A historical AGB grid scan (`b0f165c4-…`) regressed `beam_center ≈ a + 5.82·motor_x`
+/ `a + 5.99·motor_y`. That slope is the rate at which the **PV itself** moves —
+not an extra term to add. Adding `(motor − ref) · slope` on top of a PV that
+already encodes the motor position double-counts: for an AGB scan at
+`motor_y = −18.5 mm` it shoved the beam center ~120 px off (row 877 instead of
+the true ~1003, verified by AgBh ring fitting). Set these slopes non-zero **only**
+for a future detector whose beam-center PV is a static, position-independent
+calibration value. The per-call overrides
+(`beam_col_px_per_motor_x_mm`, `beam_row_px_per_motor_y_mm`) remain available.
 
 ## SDD → motor_z mapping (SAXS)
 

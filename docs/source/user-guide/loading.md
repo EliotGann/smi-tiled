@@ -77,20 +77,27 @@ reference.
 
 ## Motor-driven corrections
 
-The default beam center and SDD come from the EPICS baseline PVs, but
-those are **static** calibration values set at a known motor
-configuration.  When the detector translates (`pil2M_motor_x/y`) or
-the sample moves along the beam (`piezo_z`, `pil2M_motor_z`), the
-beam-on-detector pixel shifts.  The loader applies linear corrections
-calibrated from AGB grid scans (see {doc}`calibration`):
+The default beam center and SDD come from the EPICS baseline PVs.  The
+beam-center PVs (`pil2M_beam_center_x/y_px`) **already track the detector
+translation motors** (`pil2M_motor_x/y`), so by default the loader applies
+**no** additional motor_x/y correction — the `_SAXS_BEAM_*_PX_PER_MOTOR_X/Y_MM`
+slopes default to `0.0`.  Only the small motor_z drift and the `piezo_z`→SDD
+effect remain active (calibrated from AGB scans — see {doc}`calibration`):
 
 ```python
-beam_col += (motor_x_mm - _SAXS_MOTOR_X_REF_MM) * _SAXS_BEAM_COL_PX_PER_MOTOR_X_MM
-beam_row += (motor_y_mm - _SAXS_MOTOR_Y_REF_MM) * _SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM
+beam_col += (motor_x_mm - _SAXS_MOTOR_X_REF_MM) * _SAXS_BEAM_COL_PX_PER_MOTOR_X_MM   # 0.0 by default
+beam_row += (motor_y_mm - _SAXS_MOTOR_Y_REF_MM) * _SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM   # 0.0 by default
 beam_col += (motor_z_mm - _SAXS_MOTOR_Z_REF_MM) * _SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM
 beam_row += (motor_z_mm - _SAXS_MOTOR_Z_REF_MM) * _SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM
 dist_mm  += (piezo_z_um - _SAXS_PIEZO_Z_REF_UM) * _SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM
 dist_mm  += _SAXS_DEFAULT_DISTANCE_DELTA_MM
+```
+
+```{warning}
+A non-zero motor_x/y slope **double-counts** the detector translation (the PV
+already encodes it) and pushes the beam center ~120 px off — which also
+misplaces the beamstop sub-mask.  Keep these slopes at 0.0 unless a future
+detector reports a static, position-independent beam-center PV.
 ```
 
 These constants live in `smi_tiled.loader` and can be overridden

@@ -33,6 +33,16 @@ and emit the calibration constants the loader needs:
     _SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM = b_z
     _SAXS_PIEZO_Z_REF_UM = (motor_z - a_z) / b_z
 
+.. warning::
+    The fitted ``b_x`` / ``b_y`` (~5.82 / 5.99 px/mm) describe how the EPICS
+    beam-center PV *itself* moves with motor_x/y — the PV already tracks the
+    detector translation.  Do NOT paste them into
+    ``_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM`` / ``_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM``:
+    the loader reads that same live PV, so adding ``(motor - ref) * slope`` on
+    top double-counts and throws the beam center ~120 px off.  Those slopes
+    default to ``0.0`` in the loader and should stay 0.0 unless a future
+    detector reports a *static*, position-independent beam-center PV.
+
 Usage
 -----
     pixi run python scripts/calibrate_smi_saxs.py [UID]
@@ -417,8 +427,11 @@ def main(uid: str) -> None:
           if motor_y_ref is not None else "_SAXS_MOTOR_Y_REF_MM = ?  (b_y≈0)")
     print(f"_SAXS_PIEZO_Z_REF_UM = {piezo_z_ref:.4f}"
           if piezo_z_ref is not None else "_SAXS_PIEZO_Z_REF_UM = ?  (b_z≈0)")
-    print(f"_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM = {b_x:.6f}")
-    print(f"_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM = {b_y:.6f}")
+    print("# WARNING: b_x / b_y below are the rate the EPICS beam-center PV")
+    print("# itself moves with motor_x/y — the PV already tracks it.  Keep the")
+    print("# loader slopes at 0.0; pasting these in double-counts (~120 px off).")
+    print(f"# _SAXS_BEAM_COL_PX_PER_MOTOR_X_MM = 0.0  (measured PV slope b_x = {b_x:.6f})")
+    print(f"# _SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM = 0.0  (measured PV slope b_y = {b_y:.6f})")
     print(f"_SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM = {b_z:.6f}")
     # Also dist_delta_mm:
     print(f"# _SAXS_DEFAULT_DISTANCE_DELTA_MM should become:")
