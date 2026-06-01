@@ -192,6 +192,171 @@ class TestParseSampleNameGeometry:
 
 
 # ===========================================================================
+# resolve_incident_angle — per-frame priority chain
+# ===========================================================================
+
+class _PrimaryWithInternal(_PrimaryContainer):
+    """``_PrimaryContainer`` that also exposes ``['internal']`` (for fields
+    such as ``target_file_name`` that live in primary/internal)."""
+
+    def __init__(self, fields, internal=None, metadata=None):
+        super().__init__(fields, metadata)
+        self._internal_c = _Container(internal or {})
+
+    def __getitem__(self, key):
+        if key == "internal":
+            return self._internal_c
+        return super().__getitem__(key)
+
+
+def _run_for_ai(primary=None, internal=None, baseline=None, start=None):
+    """Build a _FakeRun whose primary stream also supports ['internal']."""
+    run = _FakeRun(primary_fields=primary or {}, baseline=baseline or {},
+                   start=start or {"uid": "ai-uid", "scan_id": 1})
+    run._primary = _PrimaryWithInternal(primary or {}, internal=internal,
+                                        metadata=run._primary.metadata)
+    return run
+
+
+class TestResolveIncidentAngle:
+    def test_primary_motor_trumps_with_offset(self):
+        # stage_th + piezo_th measured per-frame in primary → wins, + offset.
+        # A target_file_name is also present but must be ignored.
+        run = _run_for_ai(
+            primary={
+                "stage_th": np.array([1.0, 1.0, 1.0]),
+                "piezo_th": np.array([0.0, 0.5, 1.0]),
+            },
+            internal={"target_file_name": np.array(
+                ["s_ai9.00_", "s_ai9.00_", "s_ai9.00_"])},
+            baseline={"stage_th": 0.0, "piezo_th": 0.0},
+            start={"uid": "u1", "sample_name": "s_ai9.00_"},
+        )
+        ai, src = L.resolve_incident_angle(run, 3, theta_offset=-0.5)
+        np.testing.assert_allclose(ai, [0.5, 1.0, 1.5])
+        assert "primary motor" in src
+
+    def test_primary_partial_component_falls_back_to_baseline(self):
+        # Only piezo_th in primary; stage_th taken from baseline scalar.
+        run = _run_for_ai(
+            primary={"piezo_th": np.array([0.10, 0.20])},
+            baseline={"stage_th": 2.0},
+            start={"uid": "u2", "sample_name": ""},
+        )
+        ai, src = L.resolve_incident_angle(run, 2, theta_offset=0.0)
+        np.testing.assert_allclose(ai, [2.10, 2.20])
+        assert "piezo_th[primary]" in src and "stage_th[baseline]" in src
+
+    def test_target_file_name_per_frame_no_offset(self):
+        # No th motor in primary → target_file_name _ai used per-frame.
+        # theta_offset must NOT be applied to parsed string angles.
+        run = _run_for_ai(
+            internal={"target_file_name": np.array([
+                "Lucas_2450.00eV_ai0.50_wa9",
+                "Lucas_2455.00eV_ai2.25_wa9",
+                "Lucas_2460.00eV_ai4.00_wa9",
+            ])},
+            baseline={"stage_th": 0.0, "piezo_th": 1.82},
+            start={"uid": "u3", "sample_name": "{target_file_name}"},
+        )
+        ai, src = L.resolve_incident_angle(run, 3, theta_offset=-0.5)
+        np.testing.assert_allclose(ai, [0.50, 2.25, 4.00])
+        assert "target_file_name" in src
+
+    def test_sample_name_fixed_value(self):
+        # No primary motor, no target_file_name → start-doc sample_name _ai.
+        run = _run_for_ai(
+            baseline={"stage_th": 5.0},  # present but lower priority than name
+            start={"uid": "u4", "sample_name": "film_ai0.30_wa9"},
+        )
+        ai, src = L.resolve_incident_angle(run, 4, theta_offset=-0.5)
+        np.testing.assert_allclose(ai, [0.30, 0.30, 0.30, 0.30])
+        assert "sample_name" in src
+
+    def test_baseline_last_resort_with_offset(self):
+        # Nothing else available → baseline stage_th + piezo_th + offset.
+        run = _run_for_ai(
+            baseline={"stage_th": 1.0, "piezo_th": 0.25},
+            start={"uid": "u5", "sample_name": "plain"},
+        )
+        ai, src = L.resolve_incident_angle(run, 2, theta_offset=-0.5)
+        np.testing.assert_allclose(ai, [0.75, 0.75])
+        assert "baseline" in src
+
+    def test_manual_override_beats_everything(self):
+        run = _run_for_ai(
+            primary={"stage_th": np.array([1.0, 1.0]),
+                     "piezo_th": np.array([0.0, 0.0])},
+            start={"uid": "u6", "sample_name": "film_ai0.30_"},
+        )
+        ai, src = L.resolve_incident_angle(
+            run, 2, manual_override=3.3, theta_offset=-0.5)
+        np.testing.assert_allclose(ai, [3.3, 3.3])
+        assert "manual" in src
+
+    def test_unresolved_returns_none(self):
+        run = _run_for_ai(start={"uid": "u7", "sample_name": "plain_name"})
+        ai, src = L.resolve_incident_angle(run, 3)
+        assert ai is None
+        assert src == "unresolved"
+
+    def test_target_file_name_bytes_decoded(self):
+        # HDF5/object arrays yield bytes; must decode (not str(b'...')) so
+        # the regex still matches.
+        run = _run_for_ai(
+            internal={"target_file_name": np.array(
+                [b"s_ai0.50_wa9", b"s_ai1.00_wa9", b"s_ai4.00_wa9"],
+                dtype=object)},
+            start={"uid": "u9", "sample_name": "{target_file_name}"},
+        )
+        ai, src = L.resolve_incident_angle(run, 3)
+        np.testing.assert_allclose(ai, [0.50, 1.00, 4.00])
+        assert "target_file_name" in src
+
+    def test_target_file_name_cached_round_trip(self, tmp_path):
+        # populate_cache should store the string column; reading it back from
+        # the HDF5 cache (bytes) must decode to the original strings.
+        run = _run_for_ai(
+            internal={"target_file_name": np.array(
+                ["s_ai0.50_wa9", "s_ai2.00_wa9"])},
+            baseline={"stage_th": 0.0},
+            start={"uid": "u10", "sample_name": "{target_file_name}"},
+        )
+        cache = tmp_path / "u10.h5"
+        L.populate_cache("u10", run, cache_path=cache, include_images=False)
+        L.clear_baseline_cache()
+        names = L._read_target_file_name_raw(
+            _FakeRun(start={"uid": "u10"}), cache_path=cache)
+        assert names == ["s_ai0.50_wa9", "s_ai2.00_wa9"]
+
+    def test_waxs_loader_attaches_per_frame_coord(self):
+        # End-to-end: a varying-ai scan encoded only in target_file_name
+        # surfaces as an `incident_angle_deg` frame coord on the WAXS load.
+        n = 3
+        img = np.zeros((n, 4, 5), dtype=float)
+        run = _run_for_ai(
+            primary={
+                L.WAXS_IMAGE_FIELD: img,
+                "seq_num": np.array([1, 2, 3]),
+            },
+            internal={"target_file_name": np.array([
+                "s_2450.00eV_ai0.50_wa9",
+                "s_2455.00eV_ai1.00_wa9",
+                "s_2460.00eV_ai4.00_wa9",
+            ])},
+            baseline={"stage_th": 0.0},
+            start={"uid": "u8", "sample_name": "{target_file_name}"},
+        )
+        geo = L.resolve_waxs_geometry(run)
+        da = L.load_waxs_raw(run, geo)
+        assert "incident_angle_deg" in da.coords
+        np.testing.assert_allclose(
+            da.coords["incident_angle_deg"].values, [0.50, 1.00, 4.00])
+        assert da.attrs["smi_incident_angle_deg"] == pytest.approx(0.50)
+        assert "target_file_name" in da.attrs["smi_incident_angle_source"]
+
+
+# ===========================================================================
 # resolve_saxs_geometry — fallback chain
 # ===========================================================================
 

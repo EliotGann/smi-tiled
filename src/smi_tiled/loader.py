@@ -472,6 +472,22 @@ def populate_cache(
             if field_name not in primary_grp:
                 primary_grp.create_dataset(field_name, data=arr)
 
+        # Cache the target_file_name string column (skipped above — it is
+        # non-numeric) so per-frame geometry parsing (incident angle, energy,
+        # waxs arc) works offline.  Stored as variable-length UTF-8; reads
+        # back as bytes and is decoded by _coerce_str at parse time.
+        if "target_file_name" not in primary_grp:
+            try:
+                _names = _read_target_file_name_raw(run)
+                if _names:
+                    primary_grp.create_dataset(
+                        "target_file_name",
+                        data=np.asarray(_names, dtype=object),
+                        dtype=h5py.string_dtype(encoding="utf-8"),
+                    )
+            except Exception:
+                pass
+
         # --- Baseline ---
         if "baseline" not in f:
             f.create_group("baseline")
@@ -842,8 +858,67 @@ def _read_primary_internal_array(run: Any, field: str) -> np.ndarray | None:
         return None
 
 
-def _read_target_file_name_geometry(run: Any) -> list[dict[str, float]] | None:
-    """Parse per-frame geometry from the target_file_name field in primary/internal.
+def _coerce_str(value: Any) -> str:
+    """Decode a per-frame name element to ``str``.
+
+    HDF5 string datasets (and some tiled object arrays) round-trip as
+    ``bytes`` / ``numpy.bytes_`` rather than ``str``; ``str(b"foo")`` would
+    yield ``"b'foo'"`` and break the regex parser.  Decode bytes explicitly
+    so parsing works regardless of the source.
+    """
+    if isinstance(value, bytes):  # also covers numpy.bytes_
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def _read_target_file_name_raw(
+    run: Any, cache_path: str | Path | None = None,
+) -> list[str] | None:
+    """Read the per-frame ``target_file_name`` column as a list of ``str``.
+
+    The column lives in different places across layouts, and strings may
+    arrive as ``bytes`` (HDF5) or ``str`` (tiled); all elements are decoded
+    via :func:`_coerce_str`.  Returns None when the column is unavailable.
+    """
+    raw = None
+    # 0. HDF5 disk cache — strings come back as bytes here (decoded below).
+    if cache_path is not None:
+        raw = _read_cached_primary_field(cache_path, "target_file_name")
+        if raw is not None and getattr(raw, "size", 0) == 0:
+            raw = None
+    # The scalar columns live in different places across tiled layouts:
+    #   - ``primary['internal']`` (handled by _read_primary_internal_array)
+    #   - ``primary.base['internal']`` (newer bluesky-tiled migration catalog)
+    #   - directly under ``primary`` / ``primary['data']``
+    # Try them in turn so target_file_name parsing works regardless.
+    if raw is None:
+        raw = _read_primary_internal_array(run, "target_file_name")
+    if raw is None:
+        try:
+            base = getattr(run["primary"], "base", None)
+            if base is not None:
+                internal = base["internal"]
+                if "target_file_name" in list(internal):
+                    node = internal["target_file_name"]
+                    raw = np.asarray(
+                        node.read() if hasattr(node, "read") else node[...])
+        except Exception:
+            raw = None
+    if raw is None:
+        try:
+            node = _get_primary_field_node(run, "target_file_name")
+            raw = np.asarray(node.read() if hasattr(node, "read") else node[...])
+        except Exception:
+            raw = None
+    if raw is None:
+        return None
+    return [_coerce_str(name) for name in np.asarray(raw).ravel()]
+
+
+def _read_target_file_name_geometry(
+    run: Any, cache_path: str | Path | None = None,
+) -> list[dict[str, float]] | None:
+    """Parse per-frame geometry from the target_file_name field.
 
     Returns a list of dicts (one per frame), each containing parsed geometry
     parameters (waxs_arc_deg, energy_kev, incident_angle_deg, etc.).
@@ -853,16 +928,12 @@ def _read_target_file_name_geometry(run: Any) -> list[dict[str, float]] | None:
     if _rid in _TARGET_FILE_NAME_CACHE:
         return _TARGET_FILE_NAME_CACHE[_rid]
 
-    raw = _read_primary_internal_array(run, "target_file_name")
-    if raw is None:
+    names = _read_target_file_name_raw(run, cache_path=cache_path)
+    if names is None:
         _TARGET_FILE_NAME_CACHE[_rid] = None
         return None
 
-    result = []
-    for name in raw:
-        name_str = str(name) if not isinstance(name, str) else name
-        result.append(parse_sample_name_geometry(name_str))
-
+    result = [parse_sample_name_geometry(name) for name in names]
     _TARGET_FILE_NAME_CACHE[_rid] = result
     return result
 
@@ -919,6 +990,126 @@ def parse_sample_name_geometry(sample_name: str) -> dict[str, float]:
         result["theta_deg"] = float(m.group(1))
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Incident-angle resolution
+# ---------------------------------------------------------------------------
+
+def _primary_per_frame_motor(
+    run: Any, field: str, n_frames: int,
+    cache_path: str | Path | None = None,
+) -> np.ndarray | None:
+    """Return a per-frame array for ``field`` iff it is *measured* in the
+    primary stream (data or internal); else None.
+
+    Gating on ``_has_primary_field``/``_has_primary_internal_field`` first
+    ensures the value really comes from primary — ``_read_scan_axis`` alone
+    would silently fall back to baseline/sample_name.  A length-1 result is
+    broadcast to ``n_frames``; a mismatched length yields None.
+    """
+    if not (_has_primary_field(run, field)
+            or _has_primary_internal_field(run, field)):
+        return None
+    arr = _read_scan_axis(run, field, cache_path=cache_path)
+    if arr is None or arr.size == 0:
+        return None
+    arr = np.asarray(arr, dtype=float)
+    if arr.shape[0] == n_frames:
+        return arr
+    if arr.shape[0] == 1:
+        return np.full(n_frames, arr[0], dtype=float)
+    return None
+
+
+def resolve_incident_angle(
+    run: Any,
+    n_frames: int,
+    *,
+    manual_override: float | None = None,
+    theta_offset: float = 0.0,
+    cache_path: str | Path | None = None,
+) -> tuple[np.ndarray | None, str]:
+    """Resolve the per-frame incident angle (degrees) for a run.
+
+    Priority (highest first):
+
+    0. ``manual_override`` — broadcast, no offset.
+    1. **Primary measured motor** ``stage_th + piezo_th`` (per-frame) ``+ theta_offset``.
+       Engaged when either motor is genuinely present in the primary stream;
+       a component absent from primary falls back to its baseline scalar.
+    2. **target_file_name** parsed ``_ai`` (per-frame).  *No offset.*
+    3. **start-doc sample_name** ``_ai`` (then ``_th``).  *No offset.*
+    4. **Baseline** ``stage_th + piezo_th`` ``+ theta_offset`` — last resort.
+
+    The zero offset (``theta_offset``) converts a raw motor reading to a true
+    incident angle, so it is applied only to motor-derived paths (1 and 4),
+    never to angles parsed from ``target_file_name`` / ``sample_name`` (which
+    already record the commanded angle).
+
+    Returns ``(array_of_length_n_frames | None, source_description)``.
+    """
+    n_frames = int(n_frames)
+
+    if manual_override is not None:
+        return (np.full(n_frames, float(manual_override)),
+                f"manual override = {manual_override}°")
+
+    # 1. Primary measured motor (stage_th + piezo_th)
+    stage_primary = _primary_per_frame_motor(run, "stage_th", n_frames, cache_path)
+    piezo_primary = _primary_per_frame_motor(run, "piezo_th", n_frames, cache_path)
+    if stage_primary is not None or piezo_primary is not None:
+        if stage_primary is not None:
+            stage, stage_src = stage_primary, "stage_th[primary]"
+        else:
+            bl = _baseline_scalar(run, "stage_th")
+            stage = (np.full(n_frames, float(bl)) if bl is not None
+                     else np.zeros(n_frames))
+            stage_src = "stage_th[baseline]" if bl is not None else "stage_th[0]"
+        if piezo_primary is not None:
+            piezo, piezo_src = piezo_primary, "piezo_th[primary]"
+        else:
+            bl = _baseline_scalar(run, "piezo_th")
+            piezo = (np.full(n_frames, float(bl)) if bl is not None
+                     else np.zeros(n_frames))
+            piezo_src = "piezo_th[baseline]" if bl is not None else "piezo_th[0]"
+        ai = stage + piezo + float(theta_offset)
+        return ai, (f"primary motor: {stage_src} + {piezo_src} "
+                    f"+ offset({theta_offset})")
+
+    # 2. target_file_name parsed _ai (per-frame, no offset)
+    tfn_geo = _read_target_file_name_geometry(run, cache_path=cache_path)
+    if tfn_geo:
+        vals = [g.get("incident_angle_deg") for g in tfn_geo]
+        if all(v is not None for v in vals):
+            arr = np.asarray(vals, dtype=float)
+            if arr.shape[0] == n_frames:
+                return arr, "target_file_name _ai (per-frame)"
+            if arr.shape[0] == 1:
+                return np.full(n_frames, arr[0]), "target_file_name _ai"
+
+    # 3. start-doc sample_name fixed value (no offset)
+    start = run.metadata.get("start", {})
+    name_geo = parse_sample_name_geometry(start.get("sample_name", ""))
+    v = name_geo.get("incident_angle_deg")
+    src_key = "ai"
+    if v is None:
+        v = name_geo.get("theta_deg")
+        src_key = "th"
+    if v is not None:
+        return np.full(n_frames, float(v)), f"sample_name _{src_key}"
+
+    # 4. Baseline motor (last resort)
+    stage_bl = _baseline_scalar(run, "stage_th")
+    piezo_bl = _baseline_scalar(run, "piezo_th")
+    if stage_bl is not None or piezo_bl is not None:
+        ai_val = ((float(stage_bl) if stage_bl is not None else 0.0)
+                  + (float(piezo_bl) if piezo_bl is not None else 0.0)
+                  + float(theta_offset))
+        return (np.full(n_frames, ai_val),
+                f"baseline stage_th+piezo_th + offset({theta_offset})")
+
+    return None, "unresolved"
 
 
 # ---------------------------------------------------------------------------
@@ -1660,7 +1851,7 @@ def _read_scan_axis(run: Any, field: str, cache_path: str | Path | None = None) 
         "energy_energy": "energy_kev",  # returns keV, caller converts
     }
     if field in _TFN_FIELD_MAP:
-        tfn_geo = _read_target_file_name_geometry(run)
+        tfn_geo = _read_target_file_name_geometry(run, cache_path=cache_path)
         if tfn_geo is not None:
             geo_key = _TFN_FIELD_MAP[field]
             values = []
@@ -1711,6 +1902,8 @@ def load_saxs_raw(
     extra_attrs: dict[str, Any] | None = None,
     image_cache_path: str | Path | None = None,
     dask_run: Any | None = None,
+    incident_angle_deg: float | None = None,
+    theta_offset: float = 0.0,
 ) -> xr.DataArray:
     """
     Load SAXS (Pilatus 2M) raw images from a tiled run as an xr.DataArray.
@@ -1745,15 +1938,32 @@ def load_saxs_raw(
     print(f"[SMILoader] SAXS images {'opened (lazy)' if _lazy else 'loaded'} "
           f"from {_src} in {_dt:.3f}s (shape={images.shape})")
     start = run.metadata.get("start", {})
-    sample_name = start.get("sample_name", "")
-    name_geo = parse_sample_name_geometry(sample_name)
 
-    # Resolve incident angle: primary > baseline > sample_name
-    incident_angle_deg = (
-        _primary_scalar(run, "stage_th")
-        or _baseline_scalar(run, "stage_th")
-        or name_geo.get("incident_angle_deg")
-        or name_geo.get("theta_deg")
+    # Squeeze + flatten leading dims up front so n_frames is known before the
+    # (per-frame) incident-angle resolution below.
+    # (e.g. (120, 1, 619, 1475) -> (120, 619, 1475))
+    images = np.squeeze(images)
+    is_single_2d = images.ndim == 2
+    if not is_single_2d:
+        # Flatten leading dimensions into frames; last two are (pix_y, pix_x)
+        if images.ndim > 3:
+            orig_shape = images.shape
+            images = images.reshape(-1, *images.shape[-2:])
+            print(f"[SMILoader] SAXS images reshaped from {orig_shape} to {images.shape}")
+        if images.ndim != 3:
+            raise ValueError(
+                f"Expected 2-D or 3-D SAXS image array, got {images.ndim}-D "
+                f"with shape {images.shape}"
+            )
+    n_frames = 1 if is_single_2d else images.shape[0]
+
+    # Resolve per-frame incident angle (primary motor > target_file_name >
+    # sample_name > baseline; see resolve_incident_angle).
+    ai_arr, ai_src = resolve_incident_angle(
+        run, n_frames,
+        manual_override=incident_angle_deg,
+        theta_offset=theta_offset,
+        cache_path=image_cache_path,
     )
 
     attrs: dict[str, Any] = {
@@ -1780,7 +1990,10 @@ def load_saxs_raw(
         "smi_beam_center_col_px": geo.beam_center_col_px,
         "smi_sample_distance_mm": geo.dist_m * 1000.0,
         "smi_active_beamstop":    geo.active_beamstop,
-        "smi_incident_angle_deg": incident_angle_deg,
+        # First-frame summary; full per-frame values live on the
+        # ``incident_angle_deg`` coord when the angle varies.
+        "smi_incident_angle_deg": (float(ai_arr[0]) if ai_arr is not None else None),
+        "smi_incident_angle_source": (ai_src if ai_arr is not None else None),
         # Run identity
         "uid":         start.get("uid", ""),
         "scan_id":     start.get("scan_id"),
@@ -1792,22 +2005,9 @@ def load_saxs_raw(
     # serializable (those backends reject None in attrs).
     attrs = {k: v for k, v in attrs.items() if v is not None}
 
-    # Squeeze singleton dimensions (e.g. (120, 1, 619, 1475) -> (120, 619, 1475))
-    images = np.squeeze(images)
-    if images.ndim == 2:
+    if is_single_2d:
         return xr.DataArray(images, dims=["pix_y", "pix_x"], attrs=attrs)
 
-    # Flatten leading dimensions into frames; last two are always (pix_y, pix_x)
-    if images.ndim > 3:
-        orig_shape = images.shape
-        images = images.reshape(-1, *images.shape[-2:])
-        print(f"[SMILoader] SAXS images reshaped from {orig_shape} to {images.shape}")
-    if images.ndim != 3:
-        raise ValueError(
-            f"Expected 2-D or 3-D SAXS image array, got {images.ndim}-D "
-            f"with shape {images.shape}"
-        )
-    n_frames = images.shape[0]
     arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD, cache_path=image_cache_path)
     if arc_angles is not None and arc_angles.shape[0] == n_frames:
         frame_coord = arc_angles
@@ -1828,6 +2028,10 @@ def load_saxs_raw(
         if arr.shape[0] == n_frames:
             coords[motor_name] = (frame_dim_name, arr.astype(float))
 
+    # Per-frame incident angle (e.g. an ai-scan encoded in target_file_name).
+    if ai_arr is not None and ai_arr.shape[0] == n_frames:
+        coords["incident_angle_deg"] = (frame_dim_name, ai_arr.astype(float))
+
     return xr.DataArray(
         images,
         dims=[frame_dim_name, "pix_y", "pix_x"],
@@ -1846,6 +2050,8 @@ def load_waxs_raw(
     extra_attrs: dict[str, Any] | None = None,
     image_cache_path: str | Path | None = None,
     dask_run: Any | None = None,
+    incident_angle_deg: float | None = None,
+    theta_offset: float = 0.0,
 ) -> xr.DataArray:
     """
     Load WAXS (900KW) raw images from a tiled run as an xr.DataArray.
@@ -1894,16 +2100,6 @@ def load_waxs_raw(
     print(f"[SMILoader] WAXS images {'opened (lazy)' if _lazy else 'loaded'} "
           f"from {_src} in {_dt:.3f}s (shape={images.shape})")
     start  = run.metadata.get("start", {})
-    sample_name = start.get("sample_name", "")
-    name_geo = parse_sample_name_geometry(sample_name)
-
-    # Resolve incident angle: primary > baseline > sample_name
-    incident_angle_deg = (
-        _primary_scalar(run, "stage_th")
-        or _baseline_scalar(run, "stage_th")
-        or name_geo.get("incident_angle_deg")
-        or name_geo.get("theta_deg")
-    )
 
     arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD, cache_path=image_cache_path)
     bsx_values = _read_scan_axis(run, WAXS_BSX_FIELD, cache_path=image_cache_path)
@@ -1924,6 +2120,15 @@ def load_waxs_raw(
             f"with shape {images.shape}"
         )
     n_frames = images.shape[0]
+
+    # Resolve per-frame incident angle (primary motor > target_file_name >
+    # sample_name > baseline; see resolve_incident_angle).
+    ai_arr, ai_src = resolve_incident_angle(
+        run, n_frames,
+        manual_override=incident_angle_deg,
+        theta_offset=theta_offset,
+        cache_path=image_cache_path,
+    )
 
     if arc_angles is None:
         arc_angles = np.zeros(n_frames, dtype=float)
@@ -1991,7 +2196,10 @@ def load_waxs_raw(
         "smi_panels":                json.dumps(panels_attr),
         "smi_waxs_bsx_per_frame":    bsx_values.tolist(),
         "smi_energy_per_frame_ev":   energy_per_frame_ev.tolist(),
-        "smi_incident_angle_deg":    incident_angle_deg,
+        # First-frame summary; full per-frame values live on the
+        # ``incident_angle_deg`` coord when the angle varies.
+        "smi_incident_angle_deg":    (float(ai_arr[0]) if ai_arr is not None else None),
+        "smi_incident_angle_source": (ai_src if ai_arr is not None else None),
         # Run identity
         "uid":         start.get("uid", ""),
         "scan_id":     start.get("scan_id"),
@@ -2003,10 +2211,15 @@ def load_waxs_raw(
     # serializable (those backends reject None in attrs).
     attrs = {k: v for k, v in attrs.items() if v is not None}
 
+    coords: dict[str, Any] = {WAXS_ARC_FIELD: arc_angles}
+    # Per-frame incident angle (e.g. an ai-scan encoded in target_file_name).
+    if ai_arr is not None and ai_arr.shape[0] == n_frames:
+        coords["incident_angle_deg"] = (WAXS_ARC_FIELD, ai_arr.astype(float))
+
     return xr.DataArray(
         images,
         dims=[WAXS_ARC_FIELD, "pix_y", "pix_x"],
-        coords={WAXS_ARC_FIELD: arc_angles},
+        coords=coords,
         attrs=attrs,
     )
 
@@ -2454,6 +2667,8 @@ class TiledSMISWAXSLoader:
         geo_overrides: dict[str, Any] | None = None,
         extra_attrs: dict[str, Any] | None = None,
         image_cache_path: str | Path | None = None,
+        incident_angle_deg: float | None = None,
+        theta_offset: float = 0.0,
     ) -> xr.DataArray | None:
         """
         Load raw images for one run.
@@ -2471,6 +2686,15 @@ class TiledSMISWAXSLoader:
         image_cache_path : str, Path, or None
             If given, attempt to read images from this HDF5 cache file
             before falling back to tiled.
+        incident_angle_deg : float or None
+            Manual per-frame incident-angle override (degrees).  ``None``
+            (default) auto-resolves via :func:`resolve_incident_angle`
+            (primary motor → ``target_file_name`` → ``sample_name`` →
+            baseline).
+        theta_offset : float
+            Zero offset (degrees) added to *motor-derived* incident angles
+            (``stage_th + piezo_th``).  Not applied to angles parsed from
+            ``target_file_name``/``sample_name``.
 
         Returns
         -------
@@ -2498,7 +2722,9 @@ class TiledSMISWAXSLoader:
                 run, energy_kev=self.energy_kev, **overrides
             )
             return load_saxs_raw(run, geo, extra_attrs=extra_attrs,
-                                 image_cache_path=image_cache_path, dask_run=dask_run)
+                                 image_cache_path=image_cache_path, dask_run=dask_run,
+                                 incident_angle_deg=incident_angle_deg,
+                                 theta_offset=theta_offset)
 
         if detector == "waxs":
             if not _has_primary_field(run, WAXS_IMAGE_FIELD):
@@ -2507,7 +2733,9 @@ class TiledSMISWAXSLoader:
                 run, energy_kev=self.energy_kev, **overrides
             )
             return load_waxs_raw(run, geo, extra_attrs=extra_attrs,
-                                 image_cache_path=image_cache_path, dask_run=dask_run)
+                                 image_cache_path=image_cache_path, dask_run=dask_run,
+                                 incident_angle_deg=incident_angle_deg,
+                                 theta_offset=theta_offset)
 
         raise ValueError(
             f"Unknown detector '{detector}'. Expected 'saxs' or 'waxs'."
@@ -2518,9 +2746,14 @@ class TiledSMISWAXSLoader:
         uid: str,
         geo_overrides: dict[str, Any] | None = None,
         extra_attrs: dict[str, Any] | None = None,
+        incident_angle_deg: float | None = None,
+        theta_offset: float = 0.0,
     ) -> dict[str, xr.DataArray]:
         """
         Load both SAXS and WAXS raw images for one run.
+
+        ``incident_angle_deg`` / ``theta_offset`` are forwarded to
+        :meth:`loadSingleImage` (see :func:`resolve_incident_angle`).
 
         Returns
         -------
@@ -2529,9 +2762,11 @@ class TiledSMISWAXSLoader:
         return {
             "saxs": self.loadSingleImage(
                 uid, "saxs", geo_overrides=geo_overrides, extra_attrs=extra_attrs,
+                incident_angle_deg=incident_angle_deg, theta_offset=theta_offset,
             ),
             "waxs": self.loadSingleImage(
                 uid, "waxs", geo_overrides=geo_overrides, extra_attrs=extra_attrs,
+                incident_angle_deg=incident_angle_deg, theta_offset=theta_offset,
             ),
         }
 

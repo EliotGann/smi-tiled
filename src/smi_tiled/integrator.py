@@ -2231,58 +2231,32 @@ def find_incident_angle(
 ) -> tuple[np.ndarray, str]:
     """Determine per-frame incident angle (degrees).
 
-    Only fetches individual columns from tiled — never reads the full
-    primary stream.
+    Thin wrapper over :func:`smi_tiled.loader.resolve_incident_angle`, which
+    resolves the angle per-frame with the priority:
 
-    Priority order:
-    1. ``manual_override`` if not None
-    2. ``sample_name`` string parsing (``ai0.12`` etc.)
-    3. Motor positions: ``stage_th + piezo_th + theta_offset``
+    0. ``manual_override`` if not None.
+    1. **Primary measured motor** ``stage_th + piezo_th`` ``+ theta_offset``.
+    2. **target_file_name** parsed ``_ai`` (per-frame, no offset).
+    3. **sample_name** parsed ``_ai``/``_th`` (no offset).
+    4. **Baseline** ``stage_th + piezo_th`` ``+ theta_offset`` (last resort).
 
-    Returns ``(alpha_i_array, source_description)``.
+    The zero offset is applied only to motor-derived paths (1 and 4).
+
+    Returns ``(alpha_i_array, source_description)``.  Raises ``RuntimeError``
+    when no source resolves.
     """
-    start = run.metadata.get("start", {})
-    sample_name = start.get("sample_name", "")
+    from smi_tiled.loader import resolve_incident_angle
 
-    if manual_override is not None:
-        return np.full(n_frames, float(manual_override)), \
-            f"manual override = {manual_override}\u00b0"
-
-    ai_from_name = parse_incident_angle_from_string(sample_name)
-    if ai_from_name is not None:
-        return np.full(n_frames, ai_from_name), \
-            f"sample_name parsed: ai={ai_from_name}\u00b0"
-
-    # Motor positions — fetch individual columns only
-    primary_ds = run["primary"]
-    baseline_ds = run["baseline"]
-
-    stage_th = None
-    try:
-        stage_th = float(baseline_ds["stage_th"].read()[0])
-    except (KeyError, IndexError):
-        pass
-
-    piezo_th = None
-    if "piezo_th" in primary_ds:
-        piezo_th = np.asarray(primary_ds["piezo_th"].read(), dtype=float)
-    else:
-        try:
-            piezo_th = np.full(n_frames, float(baseline_ds["piezo_th"].read()[0]))
-        except (KeyError, IndexError):
-            pass
-
-    if stage_th is not None and piezo_th is not None:
-        ai = stage_th + piezo_th + theta_offset
-        return ai, f"stage_th({stage_th:.4f}) + piezo_th + offset({theta_offset})"
-
-    if piezo_th is not None:
-        return piezo_th + theta_offset, \
-            f"piezo_th + offset({theta_offset}) [no stage_th]"
-
-    raise RuntimeError(
-        "Cannot determine incident angle. Pass incident_angle_deg manually."
+    ai, source = resolve_incident_angle(
+        run, n_frames,
+        manual_override=manual_override,
+        theta_offset=theta_offset,
     )
+    if ai is None:
+        raise RuntimeError(
+            "Cannot determine incident angle. Pass incident_angle_deg manually."
+        )
+    return ai, source
 
 
 def integrate_waxs_gi(
