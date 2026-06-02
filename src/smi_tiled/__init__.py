@@ -42,6 +42,7 @@ from .integrator import (
     MultiPanelArcDetector,
     WAXSCalibration,
     PanelSpec,
+    ProgressCallback,
     make_saxs_mask_from_spec,
     make_saxs_mask_from_dict,
     make_waxs_mask_callable,
@@ -78,6 +79,7 @@ __all__ = [
     "CombinedReductionResult", "GIReductionResult",
     "integrate_saxs", "integrate_waxs",
     "MultiPanelArcDetector", "WAXSCalibration", "PanelSpec",
+    "ProgressCallback",
     # Masks
     "make_saxs_mask_from_spec", "make_saxs_mask_from_dict",
     "make_waxs_mask_callable", "make_waxs_mask_callable_from_dict",

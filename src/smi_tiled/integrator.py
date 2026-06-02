@@ -110,7 +110,13 @@ import time as _time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence, Tuple
+from typing import Any, Callable, Sequence, Tuple
+
+#: Callback signature for progress reporting from reduction pipelines.
+#: ``(stage, current, total)`` — *stage* is a short string identifier
+#: (e.g. ``"saxs_integrate"``), *current* is the 1-based step index,
+#: and *total* is the number of steps in that stage.
+ProgressCallback = Callable[[str, int, int], None]
 
 import numpy as np
 import xarray as xr
@@ -1167,9 +1173,9 @@ def mask_for_frame(
 # SAXS large-area masks (WAXS shadow + aperture)
 _DEFAULT_SAXS_WAXS_SHADOW = {
     "enabled": True,
-    "beam_visible_deg": 14.5,
+    "beam_visible_deg": 14.15,
     "clear_edge_deg": 18.0,
-    "beam_visible_offset_px": 0.0,
+    "beam_visible_offset_px": -3.0,
     "edge_margin_px": 0.0,
 }
 _DEFAULT_SAXS_APERTURE = {
@@ -2269,6 +2275,7 @@ def integrate_waxs_gi(
     dezinger_threshold: float | None = None,
     dezinger_kernel: int = 5,
     pixel_splitting: int = 1,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """WAXS GI reduction: bin each frame into (qxy, qz) in the sample frame.
 
@@ -2403,6 +2410,9 @@ def integrate_waxs_gi(
         with np.errstate(invalid="ignore", divide="ignore"):
             frame_maps.append(np.where(N_hist > 0, I_hist / N_hist, np.nan))
 
+        if progress is not None:
+            progress("gi_integrate", fi + 1, n_frames)
+
     with np.errstate(invalid="ignore", divide="ignore"):
         summed = np.where(accum_N > 0, accum_I / accum_N, np.nan)
 
@@ -2473,6 +2483,7 @@ def reduce_smi_gi(
     image_cache_path: str | Path | None = "auto",
     populate_disk_cache: bool = True,
     pixel_splitting: int = 1,
+    progress: ProgressCallback | None = None,
 ) -> GIReductionResult:
     """Full grazing-incidence WAXS reduction pipeline.
 
@@ -2519,6 +2530,11 @@ def reduce_smi_gi(
     pixel_splitting : int
         Number of sub-pixel divisions per axis for fractional pixel
         splitting during histogram binning.  1 (default) disables splitting.
+    progress : callable or None
+        Optional callback ``(stage: str, current: int, total: int) -> None``
+        invoked to report progress.  Stages: ``"load"``, ``"gi_setup"``,
+        ``"gi_integrate"``.  *current* is 1-based; *total* is the number of
+        steps in that stage.
 
     Returns
     -------
@@ -2580,6 +2596,9 @@ def reduce_smi_gi(
         raise RuntimeError(f"No WAXS data in scan {uid}")
     t_load = _time.perf_counter()
 
+    if progress is not None:
+        progress("load", 1, 1)
+
     # Populate disk cache for future runs if data was fetched from tiled
     if populate_disk_cache and _cache_was_missing:
         try:
@@ -2608,6 +2627,9 @@ def reduce_smi_gi(
         cal_dict.update(waxs_cal_overrides)
     waxs_cal = WAXSCalibration(**cal_dict)
 
+    if progress is not None:
+        progress("gi_setup", 1, 1)
+
     # --- Integrate ---
     t_int = _time.perf_counter()
     gi_out = integrate_waxs_gi(
@@ -2620,6 +2642,7 @@ def reduce_smi_gi(
         dezinger_threshold=dezinger_threshold,
         dezinger_kernel=dezinger_kernel,
         pixel_splitting=pixel_splitting,
+        progress=progress,
     )
     t_done = _time.perf_counter()
 
@@ -2770,6 +2793,7 @@ def integrate_saxs(
     build_detector_ds: bool | None = None,
     build_frame_qchi: bool = True,
     frame_qchi_store: "str | Path | None" = None,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """SAXS reduction via direct pixel-space q-map and histogram binning.
 
@@ -3003,6 +3027,9 @@ def integrate_saxs(
                 ds_images[idx] = img_raw
                 ds_masks[idx] = pfv
 
+            if progress is not None:
+                progress("saxs_integrate", idx + 1, n_frames)
+
     print(f"  [integrate_saxs] per-frame loop ({n_frames} frames): "
           f"{_time.perf_counter() - _t_loop:.3f}s "
           f"(io={_t_io:.3f}s, dez={_t_dez:.3f}s, hist={_t_hist_total:.3f}s, "
@@ -3068,6 +3095,7 @@ def integrate_waxs(
     build_detector_ds: bool | None = None,
     build_frame_qchi: bool = True,
     frame_qchi_store: "str | Path | None" = None,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """WAXS reduction via MultiPanelArcDetector per arc-angle frame.
 
@@ -3303,6 +3331,9 @@ def integrate_waxs(
             frame_iq.append(frame_out["iq"])
             _t_waxs_qchi += _time.perf_counter() - _tq
 
+            if progress is not None:
+                progress("waxs_integrate", fi + 1, n_frames)
+
     print(f"  [integrate_waxs] per-frame loop ({len(arc_angles)} frames): "
           f"{_time.perf_counter() - _t_loop:.3f}s "
           f"(io={_t_waxs_io:.3f}s, mask={_t_waxs_mask:.3f}s, dez={_t_waxs_dez:.3f}s, "
@@ -3389,6 +3420,7 @@ def reduce_smi_combined(
     frame_qchi_store: "str | Path | None" = "auto",
     image_cache_path: str | Path | None = "auto",
     populate_disk_cache: bool = True,
+    progress: ProgressCallback | None = None,
 ) -> CombinedReductionResult:
     """
     Full SAXS + WAXS reduction pipeline.
@@ -3494,6 +3526,12 @@ def reduce_smi_combined(
         the fetched images, primary scalars, and baseline to a new HDF5
         cache file after loading from tiled.  This speeds up subsequent
         reductions of the same scan (e.g. with different parameters).
+    progress : callable or None
+        Optional callback ``(stage: str, current: int, total: int) -> None``
+        invoked to report progress.  Stages: ``"load"``, ``"saxs_setup"``,
+        ``"saxs_integrate"``, ``"waxs_setup"``, ``"waxs_integrate"``,
+        ``"merge"``.  *current* is 1-based; *total* is the number of steps
+        in that stage.
 
     Returns
     -------
@@ -3552,6 +3590,24 @@ def reduce_smi_combined(
     has_saxs = saxs_raw is not None
     has_waxs = waxs_raw is not None
     t_load = _time.perf_counter()
+
+    # Extract waxs_arc for SAXS dynamic masking (WAXS shadow).
+    # integrate_saxs can auto-discover waxs_arc from its own DataArray's
+    # coordinate axis, but for single-frame (count) scans the SAXS array
+    # is squeezed to 2-D and has no waxs_arc dimension.  The WAXS
+    # DataArray retains it, so prefer that; fall back to baseline.
+    _saxs_waxs_arc = None
+    if has_waxs and waxs_raw.ndim > 2 and waxs_raw.dims[0] == "waxs_arc":
+        _saxs_waxs_arc = np.asarray(
+            waxs_raw.coords["waxs_arc"].values, dtype=float
+        )
+    elif has_saxs and saxs_raw.ndim > 2 and saxs_raw.dims[0] == "waxs_arc":
+        _saxs_waxs_arc = np.asarray(
+            saxs_raw.coords["waxs_arc"].values, dtype=float
+        )
+
+    if progress is not None:
+        progress("load", 1, 1)
 
     # Resolve per-frame q-chi streaming store.  ``"auto"`` (default) streams the
     # per-frame (q, chi) stacks to a per-uid zarr under the disk cache dir for
@@ -3632,6 +3688,9 @@ def reduce_smi_combined(
         print(f"[mask_setup] SAXS mask creation: "
               f"{_time.perf_counter() - _t_debug:.3f}s")
 
+        if progress is not None:
+            progress("saxs_setup", 1, 1)
+
         # Integrate SAXS
         t_saxs_start = _time.perf_counter()
         _dyn_kw = dict(saxs_kw.get("dynamic_saxs_kwargs") or {})
@@ -3649,6 +3708,7 @@ def reduce_smi_combined(
             n_chi=n_chi,
             solid_angle_correction=solid_angle_correction,
             rotate_cw_90=bool(opts.get("saxs_rotate_cw_90", False)),
+            waxs_arc=_saxs_waxs_arc,
             beam_center_col_px=saxs_geo.beam_center_col_px,
             dynamic_saxs_mask=bool(saxs_kw.get("dynamic_saxs_mask", False)),
             dynamic_saxs_kwargs=_dyn_kw,
@@ -3659,6 +3719,7 @@ def reduce_smi_combined(
             build_detector_ds=build_detector_ds,
             build_frame_qchi=build_frame_qchi,
             frame_qchi_store=saxs_qchi_store,
+            progress=progress,
         )
         t_saxs_end = _time.perf_counter()
 
@@ -3747,6 +3808,9 @@ def reduce_smi_combined(
                 cal_dict[k] = waxs_kw.pop(k)
         waxs_cal = WAXSCalibration(**cal_dict)
 
+        if progress is not None:
+            progress("waxs_setup", 1, 1)
+
         t_waxs_start = _time.perf_counter()
         waxs_result = integrate_waxs(
             waxs_raw=waxs_raw,
@@ -3765,6 +3829,7 @@ def reduce_smi_combined(
             build_detector_ds=build_detector_ds,
             build_frame_qchi=build_frame_qchi,
             frame_qchi_store=waxs_qchi_store,
+            progress=progress,
         )
         t_waxs_end = _time.perf_counter()
 
@@ -3781,6 +3846,9 @@ def reduce_smi_combined(
     merged_iq = merge_iq_profiles(merged_qchi, saxs_iq, waxs_iq)
     per_frame_iq = _build_per_frame_iq(merged_iq, saxs_result, waxs_result, scan_info=scan_info)
     t_merge_end = _time.perf_counter()
+
+    if progress is not None:
+        progress("merge", 1, 1)
 
     timing = {
         "total": t_merge_end - t0,

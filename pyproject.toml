@@ -97,6 +97,7 @@ pandas = "*"
 scikit-image = "*"
 h5py = "*"
 tqdm = "*"
+matplotlib = ">=3.10.9,<4"
 
 # Pixi installs the package itself in editable mode and pulls the
 # PEP-621 optional-dependency groups (tiled, upload, dev, docs) declared
