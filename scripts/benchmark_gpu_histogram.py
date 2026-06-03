@@ -96,13 +96,18 @@ def main():
     N_err = np.max(np.abs(N_cpu - N_gpu))
     print(f"    Max |I_cpu - I_gpu|: {I_err:.2e}")
     print(f"    Max |N_cpu - N_gpu|: {N_err:.2e}")
-    # float32 on MPS gives ~1e-4 relative error on large sums; float64 gives ~1e-10
-    rtol = 1e-3 if device == "mps" else 1e-10
-    I_max = np.max(np.abs(I_cpu)) or 1.0
-    N_max = np.max(np.abs(N_cpu)) or 1.0
-    assert I_err / I_max < rtol, f"Intensity mismatch: rel={I_err/I_max:.2e}"
-    assert N_err / N_max < rtol, f"Counts mismatch: rel={N_err/N_max:.2e}"
-    print("    \u2713 Results match (within precision)")
+    # float32 on MPS accumulates rounding; float64 on CUDA/CPU is exact
+    if device == "mps":
+        # MPS float32: expect ~1e-4 relative error on intensities,
+        # and up to ±1 count per bin on N (integer sums in float32)
+        I_max = np.max(np.abs(I_cpu)) or 1.0
+        assert I_err / I_max < 1e-3, f"Intensity mismatch: rel={I_err/I_max:.2e}"
+        assert N_err <= 1.0, f"Counts off by more than 1: {N_err}"
+        print("    \u2713 Results match (float32 precision: I rel<1e-3, N off ≤1)")
+    else:
+        assert I_err < 1e-10, f"Intensity mismatch: {I_err}"
+        assert N_err < 1e-10, f"Counts mismatch: {N_err}"
+        print("    \u2713 Results match exactly")
 
     # Throughput: single-frame
     n_warmup = 3
