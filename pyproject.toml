@@ -105,6 +105,7 @@ matplotlib = ">=3.10.9,<4"
 # [project.optional-dependencies] and once under [tool.pixi.*]).
 [tool.pixi.pypi-dependencies]
 smi-tiled = { path = ".", editable = true, extras = ["tiled", "upload", "dev"] }
+torch = ">=2.0"
 
 [tool.pixi.feature.docs.pypi-dependencies]
 smi-tiled = { path = ".", editable = true, extras = ["docs"] }
