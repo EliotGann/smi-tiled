@@ -143,6 +143,8 @@ class TorchBinPlan:
             ))
 
         self._torch = torch
+        # MPS doesn't support float64 scatter_add_; use float32 there
+        self._dtype = torch.float32 if device == "mps" else torch.float64
 
     def integrate_frame(
         self, img: np.ndarray, valid: np.ndarray
@@ -157,19 +159,21 @@ class TorchBinPlan:
             Per-frame validity mask (True = include).
         """
         torch = self._torch
+        dt = self._dtype
+        np_dt = np.float32 if dt == torch.float32 else np.float64
 
         # Prepare flat vectors on device
-        img_flat = img.ravel().astype(np.float64)
+        img_flat = img.ravel().astype(np_dt)
         valid_flat = valid.ravel()
         # Zero invalid pixels so NaN doesn't propagate
         wI = np.where(valid_flat, img_flat, 0.0)
-        wV = valid_flat.astype(np.float64)
+        wV = valid_flat.astype(np_dt)
 
         wI_t = torch.from_numpy(wI).to(self.device)
         wV_t = torch.from_numpy(wV).to(self.device)
 
-        I_hist = torch.zeros(self.n_bins, dtype=torch.float64, device=self.device)
-        N_hist = torch.zeros(self.n_bins, dtype=torch.float64, device=self.device)
+        I_hist = torch.zeros(self.n_bins, dtype=dt, device=self.device)
+        N_hist = torch.zeros(self.n_bins, dtype=dt, device=self.device)
 
         for bin_idx, pix_idx in self._mappings:
             # Gather pixel values for valid-in-grid pixels
@@ -200,19 +204,21 @@ class TorchBinPlan:
         N_hist : (n_frames, n_q, n_chi) array
         """
         torch = self._torch
+        dt = self._dtype
+        np_dt = np.float32 if dt == torch.float32 else np.float64
         n_frames = images.shape[0]
 
         # Flatten spatial dims: (n_frames, n_pixels)
-        imgs_flat = images.reshape(n_frames, -1).astype(np.float64)
-        vals_flat = valids.reshape(n_frames, -1).astype(np.float64)
+        imgs_flat = images.reshape(n_frames, -1).astype(np_dt)
+        vals_flat = valids.reshape(n_frames, -1).astype(np_dt)
         # Zero invalid pixels
         imgs_flat = np.where(vals_flat > 0, imgs_flat, 0.0)
 
         imgs_t = torch.from_numpy(imgs_flat).to(self.device)
         vals_t = torch.from_numpy(vals_flat).to(self.device)
 
-        I_all = torch.zeros(n_frames, self.n_bins, dtype=torch.float64, device=self.device)
-        N_all = torch.zeros(n_frames, self.n_bins, dtype=torch.float64, device=self.device)
+        I_all = torch.zeros(n_frames, self.n_bins, dtype=dt, device=self.device)
+        N_all = torch.zeros(n_frames, self.n_bins, dtype=dt, device=self.device)
 
         for bin_idx, pix_idx in self._mappings:
             # Gather columns for all frames: (n_frames, n_valid_pix)
