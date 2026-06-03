@@ -2444,36 +2444,96 @@ def infer_detectors_and_steps(
         _n_shape_checks = 0
         _n_reads = 0
         step_candidates: list[dict[str, Any]] = []
-        for name in vars_all:
-            shp = _shape_of(name)
-            _n_shape_checks += 1
-            if len(shp) != 1 or shp[0] != n_frames:
-                continue
-            try:
-                node = field_container[name]
-                values = np.asarray(
-                    node.read() if hasattr(node, "read") else node[...],
-                    dtype=float,
+
+        # Fast path: bulk-read all scalar fields in ONE HTTP request via
+        # the tiled internal DataFrameClient (contains only scalar columns,
+        # not detector images).  This avoids N individual round-trips.
+        _bulk_df = None
+        _bulk_node = primary_node if primary_node is not None else field_container
+        try:
+            base = getattr(_bulk_node, "base", None)
+            if base is not None:
+                for _key, _child in base.items():
+                    if type(_child).__name__ == "DataFrameClient":
+                        _bulk_df = _child.read()
+                        break
+        except Exception:
+            _bulk_df = None
+
+        if _bulk_df is not None:
+            # We got all scalars in one request — extract step candidates.
+            # Note: vars_all retains the full field list (incl. detector fields)
+            # from the container listing above; _bulk_df only has scalar columns.
+            _scalar_cols = sorted(str(c) for c in _bulk_df.columns)
+            n_frames = len(_bulk_df)
+            _n_reads = len(_scalar_cols)
+            for name in _scalar_cols:
+                _n_shape_checks += 1
+                try:
+                    values = np.asarray(_bulk_df[name], dtype=float)
+                except (ValueError, TypeError):
+                    continue
+                finite = values[np.isfinite(values)]
+                unique = np.unique(finite)
+                if unique.size <= 1:
+                    continue
+                step_candidates.append(
+                    {
+                        "name": name,
+                        "n_unique": int(unique.size),
+                        "min": float(np.nanmin(values)),
+                        "max": float(np.nanmax(values)),
+                        "values": values,
+                    }
                 )
-                _n_reads += 1
-            except Exception:
-                continue
-            finite = values[np.isfinite(values)]
-            unique = np.unique(finite)
-            if unique.size <= 1:
-                continue
-            step_candidates.append(
-                {
-                    "name": name,
-                    "n_unique": int(unique.size),
-                    "min": float(np.nanmin(values)),
-                    "max": float(np.nanmax(values)),
-                    "values": values,
-                }
-            )
-        print(f"[infer_detectors_and_steps] step_candidates loop "
-              f"({_n_shape_checks} shape checks, {_n_reads} reads): "
-              f"{time.perf_counter() - _t_ids:.3f}s")
+            print(f"[infer_detectors_and_steps] step_candidates bulk read "
+                  f"({_n_shape_checks} cols, {n_frames} rows): "
+                  f"{time.perf_counter() - _t_ids:.3f}s")
+        else:
+            # Fallback: per-field reads (parallelized)
+            _read_names: list[str] = []
+            for name in vars_all:
+                shp = _shape_of(name)
+                _n_shape_checks += 1
+                if len(shp) == 1 and shp[0] == n_frames:
+                    _read_names.append(name)
+
+            def _read_field(name: str) -> tuple[str, np.ndarray | None]:
+                try:
+                    node = field_container[name]
+                    values = np.asarray(
+                        node.read() if hasattr(node, "read") else node[...],
+                        dtype=float,
+                    )
+                    return (name, values)
+                except Exception:
+                    return (name, None)
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            _max_workers = min(8, len(_read_names)) if _read_names else 1
+            with ThreadPoolExecutor(max_workers=_max_workers) as executor:
+                futures = {executor.submit(_read_field, n): n for n in _read_names}
+                for fut in as_completed(futures):
+                    name, values = fut.result()
+                    _n_reads += 1
+                    if values is None:
+                        continue
+                    finite = values[np.isfinite(values)]
+                    unique = np.unique(finite)
+                    if unique.size <= 1:
+                        continue
+                    step_candidates.append(
+                        {
+                            "name": name,
+                            "n_unique": int(unique.size),
+                            "min": float(np.nanmin(values)),
+                            "max": float(np.nanmax(values)),
+                            "values": values,
+                        }
+                    )
+            print(f"[infer_detectors_and_steps] step_candidates loop "
+                  f"({_n_shape_checks} shape checks, {_n_reads} reads): "
+                  f"{time.perf_counter() - _t_ids:.3f}s")
 
     detector_prefixes = sorted(
         {name.split("_")[0] for name in vars_all if "_" in name}

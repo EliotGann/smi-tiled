@@ -861,19 +861,42 @@ def make_waxs_mask_callable_from_dict(
             if key != "beamstop"
         }
 
+    # Pre-compute the static mask once (static regions never change per frame).
+    # Only the beamstop shifts per-frame via waxs_bsx.
+    _static_mask_cache: dict[tuple[int, int], np.ndarray] = {}
+    _rotated_cache: dict[tuple[tuple[int, int], bool, float], np.ndarray] = {}
+
+    def _get_static_mask(image_shape_raw):
+        if image_shape_raw not in _static_mask_cache:
+            _static_mask_cache[image_shape_raw] = polygons_to_mask(
+                image_shape_raw, list(static_regions.values())
+            )
+        return _static_mask_cache[image_shape_raw]
+
     def mask_fn(image_shape_raw, theta_deg, waxs_bsx):
         include_beamstop = (
             beamstop_max_abs_arc_deg is None
             or abs(float(theta_deg)) <= float(beamstop_max_abs_arc_deg)
         )
-        return make_mask_for_angle(
-            image_shape_raw=image_shape_raw,
-            static_regions=static_regions,
-            beamstop_region=beamstop_region,
-            waxs_bsx=float(waxs_bsx),
-            waxs_bsx_ref=float(waxs_bsx_ref),
-            include_beamstop=include_beamstop,
-        )
+        # Cache key: (shape, beamstop_included, rounded bsx)
+        cache_key = (image_shape_raw, include_beamstop,
+                     round(float(waxs_bsx), 4) if include_beamstop else 0.0)
+        cached = _rotated_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        static_mask = _get_static_mask(image_shape_raw)
+        if include_beamstop and beamstop_region:
+            bs_shift_mm = float(waxs_bsx) - float(waxs_bsx_ref)
+            bs_shift_px = (bs_shift_mm / 0.172) * 1.088
+            shifted_bs = shift_polygon(beamstop_region, dx_px=0.0, dy_px=bs_shift_px)
+            bs_mask = polygons_to_mask(image_shape_raw, [shifted_bs])
+            raw_mask = static_mask & bs_mask
+        else:
+            raw_mask = static_mask
+        mask_rot, _ = rotate_image_and_mask(raw_mask, k=3)
+        _rotated_cache[cache_key] = mask_rot
+        return mask_rot
 
     return mask_fn
 
@@ -1196,12 +1219,22 @@ def _silver_behenate_q_rings(max_q: float, max_order: int = 20) -> np.ndarray:
 def _make_waxs_shadow_mask(
     image_shape, waxs_arc, beam_center_col_px, **kwargs
 ) -> np.ndarray:
+    """Return per-frame shadow boundary columns (1-D) for lazy evaluation.
+
+    Instead of materializing an (n_frames, ny, nx) boolean array, returns a
+    tuple (boundary_cols, always_clear_mask) where boundary_cols is shape
+    (n_frames,) and the actual mask for frame i can be computed as:
+        cols <= boundary_cols[i]  (broadcast over ny, nx)
+    Frames where always_clear_mask[i] is True are fully unmasked.
+
+    For backward compat when n_frames is small (<= 50), still returns the
+    materialized array.
+    """
     ny, nx = image_shape
     enabled = kwargs.get("enabled", True)
     if not enabled or waxs_arc is None:
         return np.ones((1, ny, nx), dtype=bool)
     waxs_arc = np.asarray(waxs_arc, dtype=float).reshape(-1)
-    cols = np.arange(nx, dtype=float)[np.newaxis, np.newaxis, :]
     beam_visible_deg = float(kwargs.get("beam_visible_deg", 14.5))
     clear_edge_deg = float(kwargs.get("clear_edge_deg", 18.0))
     clear_span = clear_edge_deg - beam_visible_deg
@@ -1215,9 +1248,43 @@ def _make_waxs_shadow_mask(
         (waxs_arc - beam_visible_deg) / clear_span
     ) * (clear_col - start_col)
     boundary_col = np.clip(boundary_col, -1.0, float(nx))
-    keep = cols <= boundary_col[:, np.newaxis, np.newaxis]
-    keep[waxs_arc >= clear_edge_deg] = True
-    return np.broadcast_to(keep, (waxs_arc.size, ny, nx)).copy()
+
+    # For small scans, materialize directly (cheap in memory).
+    if waxs_arc.size <= 50:
+        cols = np.arange(nx, dtype=float)[np.newaxis, np.newaxis, :]
+        keep = cols <= boundary_col[:, np.newaxis, np.newaxis]
+        keep[waxs_arc >= clear_edge_deg] = True
+        return np.broadcast_to(keep, (waxs_arc.size, ny, nx)).copy()
+
+    # For large scans, return a _LargeAreaMaskLazy object that computes
+    # single-frame slices on demand without materializing the full array.
+    return _LargeAreaMaskLazy(nx, ny, boundary_col, waxs_arc, clear_edge_deg)
+
+
+class _LargeAreaMaskLazy:
+    """Lazy per-frame shadow mask that mimics ndarray indexing [idx]."""
+
+    __slots__ = ("nx", "ny", "boundary_col", "clear_mask", "_shape", "_cols")
+
+    def __init__(self, nx, ny, boundary_col, waxs_arc, clear_edge_deg):
+        self.nx = nx
+        self.ny = ny
+        self.boundary_col = boundary_col  # (n_frames,)
+        self.clear_mask = waxs_arc >= clear_edge_deg  # (n_frames,) bool
+        self._shape = (len(boundary_col), ny, nx)
+        self._cols = np.arange(nx, dtype=float)
+
+    @property
+    def shape(self):
+        return self._shape
+
+    def __getitem__(self, idx):
+        if self.clear_mask[idx]:
+            return np.ones((self.ny, self.nx), dtype=bool)
+        return np.broadcast_to(
+            (self._cols <= self.boundary_col[idx])[np.newaxis, :],
+            (self.ny, self.nx),
+        )
 
 
 def _make_aperture_mask(q_abs, **kwargs) -> np.ndarray:
@@ -1271,10 +1338,36 @@ def make_saxs_large_area_masks(
     shadow_mask = _make_waxs_shadow_mask(
         image_shape, waxs_arc, beam_center_col_px, **shadow_cfg
     )
+    aperture_2d = _make_aperture_mask(q_abs, **aperture_cfg)
+
+    # If shadow_mask is lazy (large scan), return a lazy composite.
+    if isinstance(shadow_mask, _LargeAreaMaskLazy):
+        combined = _LargeAreaMaskCombined(shadow_mask, aperture_2d)
+        return combined, shadow_mask, aperture_2d
+
+    # Small scan: materialize as before.
     aperture_mask = np.broadcast_to(
-        _make_aperture_mask(q_abs, **aperture_cfg), shadow_mask.shape
+        aperture_2d, shadow_mask.shape
     ).copy()
     return shadow_mask & aperture_mask, shadow_mask, aperture_mask
+
+
+class _LargeAreaMaskCombined:
+    """Lazy combined shadow + aperture mask for large scans."""
+
+    __slots__ = ("_shadow", "_aperture_2d", "_shape")
+
+    def __init__(self, shadow: "_LargeAreaMaskLazy", aperture_2d: np.ndarray):
+        self._shadow = shadow
+        self._aperture_2d = aperture_2d
+        self._shape = shadow.shape
+
+    @property
+    def shape(self):
+        return self._shape
+
+    def __getitem__(self, idx):
+        return self._shadow[idx] & self._aperture_2d
 
 
 # ===================================================================
@@ -2979,10 +3072,22 @@ def integrate_saxs(
 
     _t_loop = _time.perf_counter()
     _t_io = _t_dez = _t_hist_total = _t_qchi_total = 0.0
-    for bstart in range(0, n_frames, IMAGE_BLOCK_FRAMES):
+
+    # Double-buffered I/O: prefetch the next block while processing the current one.
+    from concurrent.futures import ThreadPoolExecutor
+    _block_starts = list(range(0, n_frames, IMAGE_BLOCK_FRAMES))
+    _prefetch_exec = ThreadPoolExecutor(max_workers=1)
+    _prefetch_future = _prefetch_exec.submit(_load_block, _block_starts[0],
+                                             min(_block_starts[0] + IMAGE_BLOCK_FRAMES, n_frames))
+    for _bi, bstart in enumerate(_block_starts):
         bend = min(bstart + IMAGE_BLOCK_FRAMES, n_frames)
         _tio = _time.perf_counter()
-        block = _load_block(bstart, bend)
+        block = _prefetch_future.result()
+        # Submit prefetch for next block while we process this one.
+        if _bi + 1 < len(_block_starts):
+            _next_start = _block_starts[_bi + 1]
+            _next_end = min(_next_start + IMAGE_BLOCK_FRAMES, n_frames)
+            _prefetch_future = _prefetch_exec.submit(_load_block, _next_start, _next_end)
         _t_io += _time.perf_counter() - _tio
         for j in range(bend - bstart):
             idx = bstart + j
@@ -3030,6 +3135,7 @@ def integrate_saxs(
             if progress is not None:
                 progress("saxs_integrate", idx + 1, n_frames)
 
+    _prefetch_exec.shutdown(wait=False)
     print(f"  [integrate_saxs] per-frame loop ({n_frames} frames): "
           f"{_time.perf_counter() - _t_loop:.3f}s "
           f"(io={_t_io:.3f}s, dez={_t_dez:.3f}s, hist={_t_hist_total:.3f}s, "
@@ -3244,10 +3350,22 @@ def integrate_waxs(
     _t_waxs_qchi = 0.0
     _t_waxs_plan = 0.0
     _t_waxs_io = 0.0
-    for _bstart in range(0, n_frames, IMAGE_BLOCK_FRAMES):
+
+    # Double-buffered I/O: prefetch the next block while processing the current one.
+    from concurrent.futures import ThreadPoolExecutor as _TPE_waxs
+    _waxs_block_starts = list(range(0, n_frames, IMAGE_BLOCK_FRAMES))
+    _waxs_prefetch_exec = _TPE_waxs(max_workers=1)
+    _waxs_prefetch_future = _waxs_prefetch_exec.submit(
+        _load_block, _waxs_block_starts[0],
+        min(_waxs_block_starts[0] + IMAGE_BLOCK_FRAMES, n_frames))
+    for _wbi, _bstart in enumerate(_waxs_block_starts):
         _bend = min(_bstart + IMAGE_BLOCK_FRAMES, n_frames)
         _tio = _time.perf_counter()
-        _block = _load_block(_bstart, _bend)
+        _block = _waxs_prefetch_future.result()
+        if _wbi + 1 < len(_waxs_block_starts):
+            _next_s = _waxs_block_starts[_wbi + 1]
+            _next_e = min(_next_s + IMAGE_BLOCK_FRAMES, n_frames)
+            _waxs_prefetch_future = _waxs_prefetch_exec.submit(_load_block, _next_s, _next_e)
         _t_waxs_io += _time.perf_counter() - _tio
         for _j in range(_bend - _bstart):
             fi = _bstart + _j
@@ -3334,6 +3452,7 @@ def integrate_waxs(
             if progress is not None:
                 progress("waxs_integrate", fi + 1, n_frames)
 
+    _waxs_prefetch_exec.shutdown(wait=False)
     print(f"  [integrate_waxs] per-frame loop ({len(arc_angles)} frames): "
           f"{_time.perf_counter() - _t_loop:.3f}s "
           f"(io={_t_waxs_io:.3f}s, mask={_t_waxs_mask:.3f}s, dez={_t_waxs_dez:.3f}s, "
@@ -3553,6 +3672,29 @@ def reduce_smi_combined(
     opts = dict(backend_options or {})
     t0 = _time.perf_counter()
 
+    # -- Build a normalizing progress wrapper --
+    # Translate per-stage callbacks into an overall (stage, current, total)
+    # where total = n_frames_saxs + n_frames_waxs + overhead_steps.
+    # The wrapper is wired to integrate_saxs/waxs so the user's callback
+    # receives a monotonically increasing `current` across the whole pipeline.
+    _progress_user = progress
+    _progress_offset = 0
+    _progress_total = 0  # set once n_frames is known
+
+    def _progress_wrap(stage: str, current: int, total: int) -> None:
+        """Relay per-stage progress with an overall offset."""
+        nonlocal _progress_offset
+        if _progress_user is None:
+            return
+        _progress_user(stage, _progress_offset + current, _progress_total)
+
+    def _progress_advance_stage(stage: str, steps: int) -> None:
+        """Advance the offset after a stage completes, emit one callback."""
+        nonlocal _progress_offset
+        _progress_offset += steps
+        if _progress_user is not None:
+            _progress_user(stage, _progress_offset, _progress_total)
+
     # Resolve mask inputs: ``saxs_mask`` / ``waxs_mask`` (new, supports
     # dict) wins over ``saxs_mask_path`` / ``waxs_mask_path`` (legacy,
     # Path-only).  The mask builders downstream accept either form via
@@ -3606,8 +3748,16 @@ def reduce_smi_combined(
             saxs_raw.coords["waxs_arc"].values, dtype=float
         )
 
-    if progress is not None:
-        progress("load", 1, 1)
+    # Compute overall progress total now that we know frame counts.
+    # Total = 2 (setup stages) + n_saxs_frames + n_waxs_frames + 1 (merge)
+    _n_saxs_frames = (saxs_raw.shape[0] if has_saxs and saxs_raw.ndim > 2
+                      else (1 if has_saxs else 0))
+    _n_waxs_frames = (waxs_raw.shape[0] if has_waxs and waxs_raw.ndim > 2
+                      else (1 if has_waxs else 0))
+    _progress_total = 2 + _n_saxs_frames + _n_waxs_frames + 1
+    _progress_offset = 1  # "load" already done
+    if _progress_user is not None:
+        _progress_user("load", 1, _progress_total)
 
     # Resolve per-frame q-chi streaming store.  ``"auto"`` (default) streams the
     # per-frame (q, chi) stacks to a per-uid zarr under the disk cache dir for
@@ -3688,8 +3838,7 @@ def reduce_smi_combined(
         print(f"[mask_setup] SAXS mask creation: "
               f"{_time.perf_counter() - _t_debug:.3f}s")
 
-        if progress is not None:
-            progress("saxs_setup", 1, 1)
+        _progress_advance_stage("saxs_setup", 1)
 
         # Integrate SAXS
         t_saxs_start = _time.perf_counter()
@@ -3719,8 +3868,9 @@ def reduce_smi_combined(
             build_detector_ds=build_detector_ds,
             build_frame_qchi=build_frame_qchi,
             frame_qchi_store=saxs_qchi_store,
-            progress=progress,
+            progress=_progress_wrap,
         )
+        _progress_offset = 2 + _n_saxs_frames  # advance past saxs frames
         t_saxs_end = _time.perf_counter()
 
     # -- WAXS branch --
@@ -3808,8 +3958,7 @@ def reduce_smi_combined(
                 cal_dict[k] = waxs_kw.pop(k)
         waxs_cal = WAXSCalibration(**cal_dict)
 
-        if progress is not None:
-            progress("waxs_setup", 1, 1)
+        _progress_advance_stage("waxs_setup", 0)  # emit current position
 
         t_waxs_start = _time.perf_counter()
         waxs_result = integrate_waxs(
@@ -3829,8 +3978,9 @@ def reduce_smi_combined(
             build_detector_ds=build_detector_ds,
             build_frame_qchi=build_frame_qchi,
             frame_qchi_store=waxs_qchi_store,
-            progress=progress,
+            progress=_progress_wrap,
         )
+        _progress_offset = 2 + _n_saxs_frames + _n_waxs_frames
         t_waxs_end = _time.perf_counter()
 
     t_mask = _time.perf_counter()
@@ -3847,8 +3997,7 @@ def reduce_smi_combined(
     per_frame_iq = _build_per_frame_iq(merged_iq, saxs_result, waxs_result, scan_info=scan_info)
     t_merge_end = _time.perf_counter()
 
-    if progress is not None:
-        progress("merge", 1, 1)
+    _progress_advance_stage("merge", 1)
 
     timing = {
         "total": t_merge_end - t0,
