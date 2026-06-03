@@ -159,8 +159,14 @@ def main():
         # Verify batch matches single-frame
         I_single, N_single = gpu_plan.integrate_frame(frames[n_warmup][0], frames[n_warmup][1])
         batch_err = np.max(np.abs(I_batch[0] - I_single))
-        assert batch_err < 1e-6, f"Batch vs single mismatch: {batch_err}"
-        print(f"    ✓ Batch results match single-frame")
+        if device == "mps":
+            # float32 accumulation order differs between batch and single
+            I_ref = np.max(np.abs(I_single)) or 1.0
+            assert batch_err / I_ref < 1e-3, f"Batch vs single mismatch: rel={batch_err/I_ref:.2e}"
+            print(f"    ✓ Batch results match single-frame (rel<1e-3)")
+        else:
+            assert batch_err < 1e-10, f"Batch vs single mismatch: {batch_err}"
+            print(f"    ✓ Batch results match single-frame")
 
     # Projection for full scan
     print(f"\n{'=' * 70}")
