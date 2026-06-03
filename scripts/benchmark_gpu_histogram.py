@@ -96,8 +96,8 @@ def main():
     N_err = np.max(np.abs(N_cpu - N_gpu))
     print(f"    Max |I_cpu - I_gpu|: {I_err:.2e}")
     print(f"    Max |N_cpu - N_gpu|: {N_err:.2e}")
-    # float32 on MPS gives ~1e-2 relative error on large sums; float64 gives ~1e-10
-    rtol = 1e-5 if device == "mps" else 1e-10
+    # float32 on MPS gives ~1e-4 relative error on large sums; float64 gives ~1e-10
+    rtol = 1e-3 if device == "mps" else 1e-10
     I_max = np.max(np.abs(I_cpu)) or 1.0
     N_max = np.max(np.abs(N_cpu)) or 1.0
     assert I_err / I_max < rtol, f"Intensity mismatch: rel={I_err/I_max:.2e}"
