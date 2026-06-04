@@ -2273,6 +2273,7 @@ def _infer_from_cache(cache_path: str | Path, start: dict) -> dict[str, Any] | N
 
             # Build step_candidates from 1-D primary fields
             step_candidates: list[dict[str, Any]] = []
+            primary_strings: dict[str, np.ndarray] = {}
             for name in primary_fields:
                 ds = f[f"primary/{name}"]
                 if ds.ndim != 1:
@@ -2282,6 +2283,14 @@ def _infer_from_cache(cache_path: str | Path, start: dict) -> dict[str, Any] | N
                 try:
                     values = np.asarray(ds[...], dtype=float)
                 except (ValueError, TypeError):
+                    # Non-numeric (string) field — preserve for virtual axes.
+                    try:
+                        raw = ds[...]
+                    except Exception:
+                        continue
+                    arr = np.asarray(raw, dtype=object)
+                    if arr.shape[0] == n_frames:
+                        primary_strings[name] = arr
                     continue
                 finite = values[np.isfinite(values)]
                 unique = np.unique(finite)
@@ -2315,6 +2324,7 @@ def _infer_from_cache(cache_path: str | Path, start: dict) -> dict[str, Any] | N
         "detectors_start": start.get("detectors", []) or [],
         "detector_prefixes_in_primary": detector_prefixes,
         "step_candidates": step_candidates,
+        "primary_strings": primary_strings,
         "detector_fields": {
             "saxs": [n for n in vars_all if n.startswith("pil2M_")],
             "waxs": [n for n in vars_all if n.startswith("pil900KW_")],
@@ -2444,6 +2454,7 @@ def infer_detectors_and_steps(
         _n_shape_checks = 0
         _n_reads = 0
         step_candidates: list[dict[str, Any]] = []
+        primary_strings: dict[str, np.ndarray] = {}
 
         # Fast path: bulk-read all scalar fields in ONE HTTP request via
         # the tiled internal DataFrameClient (contains only scalar columns,
@@ -2472,6 +2483,14 @@ def infer_detectors_and_steps(
                 try:
                     values = np.asarray(_bulk_df[name], dtype=float)
                 except (ValueError, TypeError):
+                    # Non-numeric (string/object) column — preserve raw values
+                    # so smi_tiled.derived.virtual_axes can parse fn:* tokens.
+                    try:
+                        arr = np.asarray(_bulk_df[name].values, dtype=object)
+                    except Exception:
+                        continue
+                    if arr.shape[0] == n_frames:
+                        primary_strings[name] = arr
                     continue
                 finite = values[np.isfinite(values)]
                 unique = np.unique(finite)
@@ -2498,25 +2517,28 @@ def infer_detectors_and_steps(
                 if len(shp) == 1 and shp[0] == n_frames:
                     _read_names.append(name)
 
-            def _read_field(name: str) -> tuple[str, np.ndarray | None]:
+            def _read_field(name: str) -> tuple[str, np.ndarray | None, np.ndarray | None]:
                 try:
                     node = field_container[name]
-                    values = np.asarray(
-                        node.read() if hasattr(node, "read") else node[...],
-                        dtype=float,
-                    )
-                    return (name, values)
+                    raw = node.read() if hasattr(node, "read") else node[...]
+                    try:
+                        values = np.asarray(raw, dtype=float)
+                        return (name, values, None)
+                    except (ValueError, TypeError):
+                        return (name, None, np.asarray(raw, dtype=object))
                 except Exception:
-                    return (name, None)
+                    return (name, None, None)
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
             _max_workers = min(8, len(_read_names)) if _read_names else 1
             with ThreadPoolExecutor(max_workers=_max_workers) as executor:
                 futures = {executor.submit(_read_field, n): n for n in _read_names}
                 for fut in as_completed(futures):
-                    name, values = fut.result()
+                    name, values, strings = fut.result()
                     _n_reads += 1
                     if values is None:
+                        if strings is not None and strings.shape[0] == n_frames:
+                            primary_strings[name] = strings
                         continue
                     finite = values[np.isfinite(values)]
                     unique = np.unique(finite)
@@ -2547,6 +2569,7 @@ def infer_detectors_and_steps(
         "detectors_start": start.get("detectors", []) or [],
         "detector_prefixes_in_primary": detector_prefixes,
         "step_candidates": step_candidates,
+        "primary_strings": primary_strings,
         "detector_fields": {
             "saxs": [n for n in vars_all if n.startswith("pil2M_")],
             "waxs": [n for n in vars_all if n.startswith("pil900KW_")],

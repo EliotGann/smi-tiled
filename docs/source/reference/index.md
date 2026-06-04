@@ -10,4 +10,5 @@ calibration-format
 beamstop-offsets-format
 motor-conventions
 pyhyperscattering-compat
+derived-products-migration
 ```

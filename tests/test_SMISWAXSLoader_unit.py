@@ -835,6 +835,10 @@ class TestTiledLoaderPublicAPI:
     def _make_loader_with_fake_run(self, run, monkeypatch):
         loader = L.TiledSMISWAXSLoader()
         monkeypatch.setattr(loader, "_get_run", lambda uid: run)
+        # Prevent the dask fast path from attempting a real tiled
+        # connection (which would hit DEFAULT_TILED_URI and stall on a
+        # network timeout, adding ~20 s per test).
+        monkeypatch.setattr(loader, "_get_dask_run", lambda uid: None)
         return loader
 
     def test_load_saxs_returns_dataarray(self, monkeypatch):

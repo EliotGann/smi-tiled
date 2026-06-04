@@ -8,6 +8,9 @@ Layout
           merged_iq          ← xr.Dataset on (q,)
           merged_qchi        ← xr.Dataset on (q, chi)
           per_frame_iq       ← xr.Dataset on (frame, q)
+          per_frame_qchi/    ← group: xr.Dataset per detector (q, chi, frame)
+          line_cuts/         ← group: xr.Dataset per cut (frame?, axis)
+          peak_fits          ← xr.Dataset on (peak, frame)
 
 Each ``<uid>`` node carries the full reduction provenance as metadata
 (see :data:`PROVENANCE_FIELDS`) plus a ``reduction_hash`` for
@@ -15,9 +18,17 @@ stale-cache detection.
 """
 from __future__ import annotations
 
-#: Names of the xr.Dataset products that may be stored under a ``<uid>``
-#: node.  ``per_frame_iq`` is optional (single-frame scans omit it).
-REDUCED_DATA_KEYS: tuple[str, ...] = ("merged_iq", "merged_qchi", "per_frame_iq")
+#: Names of the xr.Dataset / group products that may be stored under a
+#: ``<uid>`` node.  All entries beyond ``merged_iq`` are optional and
+#: only written when the corresponding reduction product is non-None.
+REDUCED_DATA_KEYS: tuple[str, ...] = (
+    "merged_iq",
+    "merged_qchi",
+    "per_frame_iq",
+    "per_frame_qchi",   # group keyed by detector ("saxs", "waxs")
+    "line_cuts",        # group keyed by LineCutSpec.resolved_name()
+    "peak_fits",
+)
 
 #: Fields copied from the source run + reduction params into per-node metadata.
 #: Used both for inspection and for ``reduction_hash`` computation.
@@ -35,6 +46,10 @@ PROVENANCE_FIELDS: tuple[str, ...] = (
     "waxs_beam_col_per_arc_deg", "solid_angle_correction",
     "saxs_beam_delta_px", "waxs_beam_delta_px", "saxs_distance_delta_mm",
     "saxs_mask_hash", "waxs_mask_hash",
+    # derived-stage spec hashes (set by UploadSession from the result)
+    "virtual_axes_spec_hash",
+    "line_cuts_spec_hash",
+    "peak_fits_spec_hash",
     # package identity
     "smi_tiled_version",
     "reduction_hash",

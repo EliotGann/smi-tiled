@@ -105,7 +105,14 @@ matplotlib = ">=3.10.9,<4"
 # [project.optional-dependencies] and once under [tool.pixi.*]).
 [tool.pixi.pypi-dependencies]
 smi-tiled = { path = ".", editable = true, extras = ["tiled", "upload", "dev"] }
-torch = ">=2.0"
+# torch is intentionally NOT declared here.  ``smi_tiled.gpu_histogram`` is
+# an opt-in module that ``import torch`` only inside its own functions, and
+# nothing in ``smi_tiled`` imports it at load time.  The pip-built torch
+# wheels link against a newer libstdc++ than several BNL hosts ship, which
+# poisons the env (numpy fails to import because torch's bundled libs win
+# the linker race).  Users who want GPU acceleration should install a
+# compatible torch separately (e.g. via conda-forge pytorch or the official
+# pip wheel matched to their system libstdc++).
 
 [tool.pixi.feature.docs.pypi-dependencies]
 smi-tiled = { path = ".", editable = true, extras = ["docs"] }

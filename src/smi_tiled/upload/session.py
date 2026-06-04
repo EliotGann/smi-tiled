@@ -161,7 +161,23 @@ class UploadSession:
         """Fetch the cached per-frame I(q) for *uid*."""
         return self._get_product(uid, "per_frame_iq")
 
-    def _get_product(self, uid: str, key: str) -> xr.Dataset:
+    def get_per_frame_qchi(self, uid: str) -> dict[str, xr.Dataset]:
+        """Fetch the cached per-frame I(q, chi) group for *uid*.
+
+        Returns a ``{detector: Dataset}`` mapping (e.g. ``{"saxs": ds,
+        "waxs": ds}``).
+        """
+        return self._get_product(uid, "per_frame_qchi")
+
+    def get_line_cuts(self, uid: str) -> dict[str, xr.Dataset]:
+        """Fetch the cached line-cut group for *uid*."""
+        return self._get_product(uid, "line_cuts")
+
+    def get_peak_fits(self, uid: str) -> xr.Dataset:
+        """Fetch the cached peak-fit Dataset for *uid*."""
+        return self._get_product(uid, "peak_fits")
+
+    def _get_product(self, uid: str, key: str) -> Any:
         if key not in REDUCED_DATA_KEYS:
             raise ValueError(
                 f"key must be one of {REDUCED_DATA_KEYS}, got {key!r}"
@@ -186,6 +202,41 @@ class UploadSession:
         return catalog_path_for(uid, proposal_id=self.proposal_id)
 
     @staticmethod
+    def _derived_spec_hashes(result: Any) -> dict[str, str | None]:
+        """Compute spec hashes for the derived-stage products on *result*.
+
+        Each hash is ``None`` when the corresponding product was not
+        produced.  The hashes are deterministic over the spec content
+        (not the fitted/cut arrays) so they participate in the overall
+        ``reduction_hash`` and trigger re-upload when the spec changes.
+        """
+        from .hash import reduction_hash as _rh
+
+        out: dict[str, str | None] = {
+            "virtual_axes_spec_hash": None,
+            "line_cuts_spec_hash": None,
+            "peak_fits_spec_hash": None,
+        }
+        per_frame_iq = getattr(result, "per_frame_iq", None)
+        if per_frame_iq is not None:
+            fn_cols = sorted(
+                str(n) for n in per_frame_iq.data_vars
+                if str(n).startswith("fn:")
+            )
+            if fn_cols:
+                out["virtual_axes_spec_hash"] = _rh({"fn_columns": fn_cols})
+        line_cuts = getattr(result, "line_cuts", None)
+        if line_cuts:
+            specs = [ds.attrs for ds in line_cuts.values()]
+            out["line_cuts_spec_hash"] = _rh({"cuts": specs})
+        peak_fits = getattr(result, "peak_fits", None)
+        if peak_fits is not None:
+            out["peak_fits_spec_hash"] = _rh(
+                {"peaks": list(peak_fits.attrs.get("peaks", []))}
+            )
+        return out
+
+    @staticmethod
     def _provenance_dict(
         result: Any,
         reduction_params: dict[str, Any] | None,
@@ -206,7 +257,15 @@ class UploadSession:
         if reduction_params:
             rd.update({k: v for k, v in reduction_params.items()
                        if k in PROVENANCE_FIELDS})
-        rd["reduction_hash"] = reduction_hash(reduction_params or {})
+        # Include the derived-stage spec hashes so reduction_hash
+        # invalidates correctly when the user changes cut/peak/virtual
+        # axis specs.
+        derived_hashes = UploadSession._derived_spec_hashes(result)
+        rd.update({k: v for k, v in derived_hashes.items() if v is not None})
+        hash_inputs = dict(reduction_params or {})
+        hash_inputs.update({k: v for k, v in derived_hashes.items()
+                            if v is not None})
+        rd["reduction_hash"] = reduction_hash(hash_inputs)
         try:
             from smi_tiled import __version__ as _v
             rd["smi_tiled_version"] = _v

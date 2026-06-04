@@ -2123,6 +2123,10 @@ class CombinedReductionResult:
     timing: dict[str, float] | None = None
     geometry: str = "transmission"
     incident_angle_deg: float = 0.0
+    #: Optional derived products attached by the smi_tiled.derived stages.
+    per_frame_qchi: dict[str, xr.Dataset] | None = None
+    line_cuts: dict[str, xr.Dataset] | None = None
+    peak_fits: xr.Dataset | None = None
 
     def to_dataarray(
         self,
@@ -2242,6 +2246,9 @@ class GIReductionResult:
     q_chi_frames: xr.Dataset | None = None
     summed_ds: xr.Dataset | None = None
     timing: dict[str, float] | None = None
+    #: Optional derived products attached by the smi_tiled.derived stages.
+    line_cuts: dict[str, xr.Dataset] | None = None
+    peak_fits: xr.Dataset | None = None
 
     # -- Line cut helpers --------------------------------------------------
 
@@ -2577,6 +2584,8 @@ def reduce_smi_gi(
     populate_disk_cache: bool = True,
     pixel_splitting: int = 1,
     progress: ProgressCallback | None = None,
+    # ---- Optional derived-analysis stages (smi_tiled.derived) ----
+    line_cuts: "Sequence[Any] | None" = None,
 ) -> GIReductionResult:
     """Full grazing-incidence WAXS reduction pipeline.
 
@@ -2739,7 +2748,7 @@ def reduce_smi_gi(
     )
     t_done = _time.perf_counter()
 
-    return GIReductionResult(
+    result = GIReductionResult(
         uid=uid,
         sample_name=sample_name,
         scan_motor=scan_motor,
@@ -2758,6 +2767,10 @@ def reduce_smi_gi(
             "integrate": t_done - t_int,
         },
     )
+    if line_cuts:
+        from .derived import apply_line_cuts
+        apply_line_cuts(result, list(line_cuts))
+    return result
 
 
 # ===================================================================
@@ -3540,6 +3553,10 @@ def reduce_smi_combined(
     image_cache_path: str | Path | None = "auto",
     populate_disk_cache: bool = True,
     progress: ProgressCallback | None = None,
+    # ---- Optional derived-analysis stages (smi_tiled.derived) ----
+    virtual_axes: "Any | None" = None,
+    line_cuts: "Sequence[Any] | None" = None,
+    peak_fits: "Sequence[Any] | None" = None,
 ) -> CombinedReductionResult:
     """
     Full SAXS + WAXS reduction pipeline.
@@ -4011,7 +4028,20 @@ def reduce_smi_combined(
     # Free cached baseline data for this run
     clear_baseline_cache()
 
-    return CombinedReductionResult(
+    # Promote per-frame qchi from the per-detector dicts to a public
+    # ``per_frame_qchi`` mapping for downstream consumers (line cuts,
+    # upload schema).  The dict is keyed by detector name; absent
+    # detectors are omitted.
+    per_frame_qchi_map: dict[str, xr.Dataset] | None = None
+    _pfq: dict[str, xr.Dataset] = {}
+    if saxs_result and saxs_result.get("q_chi_frames") is not None:
+        _pfq["saxs"] = saxs_result["q_chi_frames"]
+    if waxs_result and waxs_result.get("q_chi_frames") is not None:
+        _pfq["waxs"] = waxs_result["q_chi_frames"]
+    if _pfq:
+        per_frame_qchi_map = _pfq
+
+    result = CombinedReductionResult(
         uid=uid,
         scan_info=scan_info,
         saxs=saxs_result,
@@ -4022,4 +4052,19 @@ def reduce_smi_combined(
         timing=timing,
         geometry=geometry,
         incident_angle_deg=incident_angle_deg,
+        per_frame_qchi=per_frame_qchi_map,
     )
+
+    # ---- Optional derived-analysis stages -------------------------------
+    # Each is opt-in via a kwarg.  ``virtual_axes`` defaults to running
+    # with the default config so ``fn:*`` axes from per-frame strings
+    # always appear when source data is available.
+    from .derived import apply_virtual_axes, apply_line_cuts, apply_peak_fits
+    from .derived import VirtualAxesConfig
+    va_cfg = virtual_axes if virtual_axes is not None else VirtualAxesConfig()
+    apply_virtual_axes(result, va_cfg)
+    if line_cuts:
+        apply_line_cuts(result, list(line_cuts))
+    if peak_fits:
+        apply_peak_fits(result, list(peak_fits))
+    return result
